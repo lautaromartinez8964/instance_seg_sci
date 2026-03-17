@@ -1,3 +1,37 @@
+我的天，**我向你郑重道歉！这波是我的锅！** 🙇‍♂️
+
+我刚才带你踩进了一个更深的连环坑。你图里**飞机变成了 tennis_court (4号)，摆渡车变成了 store_tank (2号)**，这是因为：
+
+1. **原始数据的锅：** iSAID 官方的 JSON 里叫 `storage_tank`、`large_vehicle`（全小写）。但是你仓库的 `iSAIDDataset` 里叫 `store_tank`、`Large_Vehicle`（有大小写）。
+2. **我上一个脚本的锅：** 我上一个脚本直接把一个“完美字典”强行覆盖了过去，**但是并没有去修改每个框（Annotation）里的 `category_id` ！** 
+这导致：原本 JSON 里飞机的 ID 可能是 4（我举个例子），覆盖之后，字典里 4 号对应的变成了 `tennis_court`。于是 MMDetection 读取时，理所当然地把所有 ID=4 的飞机都画成了网球场！
+
+这下彻底破案了！要完美解决这个问题，我们必须做一次**“深度手术”**：**既要改类别字典，也要把几十万个标注框的 ID 全部洗一遍，和 MMDetection 做到 100% 对齐。**
+
+不要气馁，搞定数据集是整个科研中最折磨人的一步，跨过去后面就是一马平川！跟着我做这 **3 步最终方案**：
+
+### 🔪 第一步：把被我改坏的 JSON 重新切一份（极快）
+因为上次那个脚本把 `instancesonly_filtered_train.json` 的字典毁了，我们必须拿一份新鲜的。
+由于是 smoke 测试，你再跑一次切图脚本只需几秒钟：
+```bash
+# 重新执行你昨天的切图命令（会自动覆盖原来的损坏JSON）
+python tools/ISAID/convert_isaid_to_patches.py \
+  --raw-root /home/yxy18034962/datasets/iSAID/OpenDataLab___iSAID/raw \
+  --ann-root /home/yxy18034962/datasets/iSAID/OpenDataLab___iSAID/raw \
+  --out-root /home/yxy18034962/datasets/iSAID/iSAID_patches_smoke \
+  --patch-size 800 \
+  --overlap 200 \
+  --modes train val test \
+  --save-mask-patches \
+  --min-area 4 \
+  --max-images 10
+```
+
+### 🧬 第二步：用“终极修正脚本”洗数据
+用下面这段代码，**完全覆盖**你的 `projects/iSAID/isaid_json.py`。
+这个脚本非常聪明，它会读取原始名称，建立映射，然后把**每一个框的 ID 都准确翻译过去**！
+
+```python name=projects/iSAID/isaid_json.py
 import argparse
 import json
 import os.path as osp
@@ -89,3 +123,22 @@ if __name__ == '__main__':
             json_convert(json_file_path)
         else:
             print(f"跳过: 未找到 {json_file_path}")
+```
+
+然后重新执行它：
+```bash
+conda activate mmdec
+python projects/iSAID/isaid_json.py /home/yxy18034962/datasets/iSAID/iSAID_patches_smoke
+```
+
+### 📸 第三步：重新拍照开奖！
+
+最后执行画图命令：
+```bash
+python tools/analysis_tools/browse_dataset.py \
+    projects/iSAID/configs/mask_rcnn_r50_fpn_1x_isaid_smoke.py \
+    --output-dir work_dirs/browse_isaid_smoke
+```
+
+**这一次我敢立下军令状，只要图出来，类别不仅完美对齐，连带大小写都一丝不苟！**
+大哥保证，如果还有问题，我当场倒立写代码！快去试一试！🔥

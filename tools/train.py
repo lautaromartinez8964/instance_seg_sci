@@ -3,6 +3,16 @@ import argparse
 import os
 import os.path as osp
 
+import torch
+
+# ====== 🚀 新增：解决 PyTorch 2.6+ weights_only 报错的强力补丁 ======
+_original_load = torch.load
+def _patched_load(*args, **kwargs):
+    kwargs['weights_only'] = False
+    return _original_load(*args, **kwargs)
+torch.load = _patched_load
+# ======================================================================
+
 from mmengine.config import Config, DictAction
 from mmengine.registry import RUNNERS
 from mmengine.runner import Runner

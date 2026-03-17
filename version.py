@@ -56,6 +56,11 @@ try:
     print(f"TIMM 版本: {timm.__version__}")
 except ImportError:
     print("⚠️ TIMM 未安装！")
-
+    
+try:
+    import numpy
+    print(f"Numpy 版本: {numpy.__version__}")
+except ImportError:
+    print("⚠️ Numpy 未安装！")
 
 print("\n========================================")
