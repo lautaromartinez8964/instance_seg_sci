@@ -17,14 +17,25 @@ from .resnext import ResNeXt
 from .ssd_vgg import SSDVGG
 from .swin import SwinTransformer
 from .trident_resnet import TridentResNet
-from .VMamba.vmamba_backbone import VMambaBackbone
-from .vmamba_official.mmdet_vssm import MM_VMamba
+
+try:    
+    from .vmamba_official.mmdet_vssm import MM_VMamba  # noqa: F401
+except Exception:    
+    MM_VMamba = None
+    
+try:
+    from .custom_Mamba.vmamba_backbone import VMambaBackbone  # noqa: F401
+except Exception:
+    VMambaBackbone = None
 
 __all__ = [
     'RegNet', 'ResNet', 'ResNetV1d', 'ResNeXt', 'SSDVGG', 'HRNet',
     'MobileNetV2', 'Res2Net', 'HourglassNet', 'DetectoRS_ResNet',
     'DetectoRS_ResNeXt', 'Darknet', 'ResNeSt', 'TridentResNet', 'CSPDarknet',
     'SwinTransformer', 'PyramidVisionTransformer',
-    'PyramidVisionTransformerV2', 'EfficientNet', 'CSPNeXt'
-    'VMambaBackbone', 'MM_VMamba'
+    'PyramidVisionTransformerV2', 'EfficientNet', 'CSPNeXt',
+    'VMambaBackbone'
+     
 ]
+if MM_VMamba is not None:    
+    __all__.append('MM_VMamba')

@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from mmdet.utils import MODELS
+from mmdet.registry import MODELS
 from .vmamba import VSSM_Official, VSSBlock_CrossScan as VSSBlock_Official, LayerNorm2d
 
 # changemamba_backbone:将通用的VMamba分类模型无缝转换为变化检测任务的特征提取器

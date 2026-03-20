@@ -36,6 +36,13 @@ except:
     from mamba2.ssd_minimal import selective_scan_chunk_fn
 
 
+# 🚀 强制破解 Backend 选择！
+# 强制让所有调用使用 mamba 或 torch 后端
+import builtins
+builtins.WITH_SELECTIVESCAN_OFLEX = False 
+builtins.WITH_SELECTIVESCAN_CORE = False
+builtins.WITH_SELECTIVESCAN_MAMBA = True # 我们装了 mamba_ssm，就用它！
+
 # =====================================================
 # we have this class as linear and conv init differ from each other
 # this function enable loading from both conv2d or linear
@@ -499,14 +506,22 @@ class SS2Dv2:
         ssoflex=True, # True: input 16 or 32 output 32 False: output dtype as input
         no_einsum=False, # replace einsum with linear or conv1d to raise throughput
         # ==============================
-        selective_scan_backend = None,
+        selective_scan_backend = "mamba",
         # ==============================
         scan_mode = "cross2d",
         scan_force_torch = False,
         # ==============================
         **kwargs,
     ):
-        assert selective_scan_backend in [None, "oflex", "mamba", "torch"]
+        # ==========================================================
+        # 🚀 TGRS 专属强力补丁：暴力拦截后端！
+        # 不管官方默认传的是 "core" 还是 "oflex" 还是 None，
+        # 我们全部强行劫持为 "mamba"，因为我们已经装了 mamba_ssm！
+        if selective_scan_backend in ["core", "oflex", None]:
+            selective_scan_backend = "mamba"
+        # ==========================================================
+        
+        assert selective_scan_backend in [None, "oflex", "mamba", "torch", "core"]
         _scan_mode = dict(cross2d=0, unidi=1, bidi=2, cascade2d=-1).get(scan_mode, None) if isinstance(scan_mode, str) else scan_mode # for debug
         assert isinstance(_scan_mode, int)
         delta_softplus = True
