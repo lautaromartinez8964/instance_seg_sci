@@ -23,7 +23,7 @@ def parse_args():
 
 
 def process_checkpoint(in_file, out_file, save_keys=['meta', 'state_dict']):
-    checkpoint = torch.load(in_file, map_location='cpu')
+    checkpoint = torch.load(in_file, map_location='cpu', weights_only=False)
 
     # only keep `meta` and `state_dict` for smaller file size
     ckpt_keys = list(checkpoint.keys())
