@@ -9,6 +9,21 @@ from mmengine import ConfigDict
 from mmengine.config import Config, DictAction
 from mmengine.runner import Runner
 
+import torch
+torch.serialization.add_safe_globals(["mmengine.logging.history_buffer.HistoryBuffer"])
+try:
+    from mmengine.logging.history_buffer import HistoryBuffer
+    torch.serialization.add_safe_globals([HistoryBuffer])
+except ImportError:
+    pass
+
+# Patch torch.load to always use weights_only=False globally for this script
+_original_load = torch.load
+def _patched_load(*args, **kwargs):
+    kwargs['weights_only'] = False
+    return _original_load(*args, **kwargs)
+torch.load = _patched_load
+
 from mmdet.engine.hooks.utils import trigger_visualization_hook
 from mmdet.evaluation import DumpDetResults
 from mmdet.registry import RUNNERS

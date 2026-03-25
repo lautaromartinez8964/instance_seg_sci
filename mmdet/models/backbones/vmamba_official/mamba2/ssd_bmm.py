@@ -67,7 +67,7 @@ def _bmm_chunk_fwd_kernel(
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = a_ptr + (offs_m[:, None] * stride_a_seqlen + offs_k[None, :] * stride_ak)
     b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_b_seqlen)
-    chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
+    chunk_size_limit = tl.minimum(chunk_size, seqlen - pid_c * chunk_size)
 
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
@@ -80,7 +80,7 @@ def _bmm_chunk_fwd_kernel(
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     if HAS_SEQ_IDX:
-        chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
+        chunk_size_limit = tl.minimum(chunk_size, seqlen - pid_c * chunk_size)
         seq_idx_m = tl.load(seq_idx_ptr + offs_m * stride_seq_idx_seqlen, mask=offs_m < chunk_size_limit, other=-1)
         seq_idx_n = tl.load(seq_idx_ptr + offs_n * stride_seq_idx_seqlen, mask=offs_n < chunk_size_limit, other=-2)
         acc = tl.where(seq_idx_m[:, None] == seq_idx_n[None, :], acc, 0.0)
@@ -136,7 +136,7 @@ def _bmm_chunk_bwd_kernel(
     offs_cs = tl.arange(0, BLOCK_SIZE_CS)
     dout_ptrs = dout_ptr + (offs_m[:, None] * stride_dout_csize_n + offs_cs[None, :] * stride_dout_csize_m)
     a_ptrs = a_ptr + (offs_cs[:, None] * stride_a_seqlen + offs_n[None, :] * stride_ak)
-    chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
+    chunk_size_limit = tl.minimum(chunk_size, seqlen - pid_c * chunk_size)
 
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for cs in range(0, tl.cdiv(chunk_size_limit, BLOCK_SIZE_CS)):

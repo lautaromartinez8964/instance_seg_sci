@@ -135,7 +135,7 @@ def _chunk_scan_chunk_state_bwd_dx_kernel(
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
 
-    chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
+    chunk_size_limit = tl.minimum(chunk_size, seqlen - pid_c * chunk_size)
 
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 

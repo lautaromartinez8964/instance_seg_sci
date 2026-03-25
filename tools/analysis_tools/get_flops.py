@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from mmengine.config import Config, DictAction
 from mmengine.logging import MMLogger
 from mmengine.model import revert_sync_batchnorm
@@ -63,6 +64,84 @@ def inference(args, logger):
     if args.cfg_options is not None:
         cfg.merge_from_dict(args.cfg_options)
 
+    # For some torch/triton/mamba_ssm version combinations, FLOPs tracing may
+    # fail in causal_conv1d custom CUDA op due strict stride constraints.
+    # We monkeypatch only in this analysis script with a numerically-compatible
+    # torch implementation to keep architecture path and make FLOPs computable.
+    try:
+        import mamba_ssm.ops.triton.ssd_combined as mamba_ssd_combined
+
+        def _safe_causal_conv1d_fwd(
+                x,
+                weight,
+                bias,
+                seq_idx=None,
+                initial_states=None,
+                final_states_out=None,
+                silu_activation=False):
+            # x: [B, D, L], weight: [D, W]
+            w = weight.unsqueeze(1).to(dtype=x.dtype, device=x.device)
+            b = bias.to(dtype=x.dtype, device=x.device) if bias is not None else None
+            y = F.conv1d(x, w, bias=b, padding=w.shape[-1] - 1, groups=x.shape[1])
+            y = y[..., :x.shape[-1]]
+            if silu_activation:
+                y = F.silu(y)
+            return y
+
+        mamba_ssd_combined.causal_conv1d_fwd_function = _safe_causal_conv1d_fwd
+
+        # Also patch vendored VMamba path if present in this codebase.
+        try:
+            import mmdet.models.backbones.vmamba_official.mamba2.ssd_combined as vmamba_ssd_combined
+            vmamba_ssd_combined.causal_conv1d_fwd_function = _safe_causal_conv1d_fwd
+            vmamba_ssd_combined.causal_conv1d_fn = (
+                lambda x, weight, bias, activation='silu':
+                _safe_causal_conv1d_fwd(
+                    x,
+                    weight,
+                    bias,
+                    seq_idx=None,
+                    initial_states=None,
+                    final_states_out=None,
+                    silu_activation=activation in ['silu', 'swish']))
+        except Exception:
+            pass
+
+        # Patch causal_conv1d package symbols directly.
+        try:
+            import causal_conv1d
+            import causal_conv1d.cpp_functions as causal_conv1d_cpp
+
+            def _safe_causal_conv1d_fn(
+                    x,
+                    weight,
+                    bias=None,
+                    seq_idx=None,
+                    initial_states=None,
+                    return_final_states=False,
+                    final_states_out=None,
+                    activation='silu',
+                    **kwargs):
+                return _safe_causal_conv1d_fwd(
+                    x,
+                    weight,
+                    bias,
+                    seq_idx=seq_idx,
+                    initial_states=initial_states,
+                    final_states_out=final_states_out,
+                    silu_activation=activation in ['silu', 'swish'])
+
+            causal_conv1d.causal_conv1d_fn = _safe_causal_conv1d_fn
+            causal_conv1d_cpp.causal_conv1d_fwd_function = _safe_causal_conv1d_fwd
+
+            # mamba2 may bind causal_conv1d_fn at import time; patch there too.
+            import mamba_ssm.modules.mamba2 as mamba2_module
+            mamba2_module.causal_conv1d_fn = _safe_causal_conv1d_fn
+        except Exception:
+            pass
+    except Exception as e:
+        logger.warning(f'Failed to patch causal_conv1d fallback: {e}')
+
     init_default_scope(cfg.get('default_scope', 'mmdet'))
 
     # TODO: The following usage is temporary and not safe
@@ -86,6 +165,10 @@ def inference(args, logger):
     model.eval()
     _forward = model.forward
 
+    # Always compute params directly so we can still report it even if
+    # JIT/Triton based FLOPs tracing fails for custom CUDA kernels.
+    total_params = sum(p.numel() for p in model.parameters())
+
     for idx, data_batch in enumerate(data_loader):
         if idx == args.num_images:
             break
@@ -95,19 +178,30 @@ def inference(args, logger):
         if hasattr(data['data_samples'][0], 'batch_input_shape'):
             result['pad_shape'] = data['data_samples'][0].batch_input_shape
         model.forward = partial(_forward, data_samples=data['data_samples'])
-        outputs = get_model_complexity_info(
-            model,
-            None,
-            inputs=data['inputs'],
-            show_table=False,
-            show_arch=False)
-        avg_flops.append(outputs['flops'])
-        params = outputs['params']
-        result['compute_type'] = 'dataloader: load a picture from the dataset'
+        try:
+            outputs = get_model_complexity_info(
+                model,
+                None,
+                inputs=data['inputs'],
+                show_table=False,
+                show_arch=False)
+            avg_flops.append(outputs['flops'])
+            result['compute_type'] = 'dataloader: load a picture from the dataset'
+        except Exception as e:
+            logger.warning(
+                'FLOPs tracing failed, fallback to params-only mode. '
+                f'Reason: {type(e).__name__}: {e}')
+            result['compute_type'] = (
+                'params-only fallback (FLOPs tracing failed on custom '
+                'kernel/JIT path)')
+            break
     del data_loader
 
-    mean_flops = _format_size(int(np.average(avg_flops)))
-    params = _format_size(params)
+    if len(avg_flops) > 0:
+        mean_flops = _format_size(int(np.average(avg_flops)))
+    else:
+        mean_flops = 'N/A'
+    params = _format_size(total_params)
     result['flops'] = mean_flops
     result['params'] = params
 

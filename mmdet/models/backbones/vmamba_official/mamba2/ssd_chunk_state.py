@@ -59,7 +59,7 @@ def _chunk_cumsum_fwd_kernel(
     A_ptrs = A_ptr + offs_h * stride_A_head
     dt_out_ptrs = dt_out_ptr + (offs_h[:, None] * stride_dt_out_head + offs_c[None, :] * stride_dt_out_csize)
     dA_cs_ptrs = dA_cumsum_ptr + (offs_h[:, None] * stride_dA_cs_head + offs_c[None, :] * stride_dA_cs_csize)
-    chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
+    chunk_size_limit = tl.minimum(chunk_size, seqlen - pid_c * chunk_size)
 
     dt = tl.load(dt_ptrs, mask=(offs_h[:, None] < nheads) & (offs_c[None, :] < chunk_size_limit), other=0.0).to(tl.float32)
     if HAS_DT_BIAS:
@@ -127,7 +127,7 @@ def _chunk_cumsum_bwd_kernel(
     dt_ptrs = dt_ptr + (offs_h[:, None] * stride_dt_head + offs_c[None, :] * stride_dt_seqlen)
     ddt_ptrs = ddt_ptr + (offs_h[:, None] * stride_ddt_head + offs_c[None, :] * stride_ddt_seqlen)
     A_ptrs = A_ptr + offs_h * stride_A_head
-    chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
+    chunk_size_limit = tl.minimum(chunk_size, seqlen - pid_c * chunk_size)
 
     ddA = tl.load(ddA_ptrs, mask=(offs_h[:, None] < nheads) & (offs_c[None, :] < chunk_size_limit), other=0.0).to(tl.float32)
     ddt_out = tl.load(ddt_out_ptrs, mask=(offs_h[:, None] < nheads) & (offs_c[None, :] < chunk_size_limit), other=0.0).to(tl.float32)
@@ -214,7 +214,7 @@ def _chunk_state_fwd_kernel(
     if HAS_SEQ_IDX:
         seq_idx_ptrs = seq_idx_ptr + offs_k * stride_seq_idx_seqlen
 
-    chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
+    chunk_size_limit = tl.minimum(chunk_size, seqlen - pid_c * chunk_size)
     if HAS_SEQ_IDX:
         seq_idx_last = tl.load(seq_idx_ptr + (chunk_size_limit - 1) * stride_seq_idx_seqlen)
 
@@ -302,7 +302,7 @@ def _chunk_state_bwd_dx_kernel(
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
 
-    chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
+    chunk_size_limit = tl.minimum(chunk_size, seqlen - pid_c * chunk_size)
     # Faster to just do 1 iteration with larger BLOCK_SIZE_K, up to block size 128
     offs_k = tl.arange(0, BLOCK_SIZE_DSTATE if BLOCK_SIZE_DSTATE <= 128 else BLOCK_SIZE_K)
     b_ptrs = b_ptr + (offs_m[:, None] * stride_b_seqlen + offs_k[None, :] * stride_b_dstate)
@@ -415,7 +415,7 @@ def _chunk_state_bwd_db_kernel(
         b_ptrs = b_ptr + (offs_m[:, None] * stride_b_seqlen + offs_n[None, :] * stride_b_dstate)
         ddA_cumsum_ptrs = ddA_cumsum_ptr + offs_m * stride_ddA_cs_csize
 
-    chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
+    chunk_size_limit = tl.minimum(chunk_size, seqlen - pid_c * chunk_size)
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     if HAS_DDA_CS:
         b = tl.load(b_ptrs, mask=(offs_m[:, None] < chunk_size_limit) & (offs_n[None, :] < dstate), other=0.0).to(tl.float32)
@@ -521,7 +521,7 @@ def _chunk_state_bwd_ddAcs_stable_kernel(
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
 
-    chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
+    chunk_size_limit = tl.minimum(chunk_size, seqlen - pid_c * chunk_size)
     # Faster to just do 1 iteration with larger BLOCK_SIZE_K, up to block size 128
     offs_k = tl.arange(0, BLOCK_SIZE_DSTATE if BLOCK_SIZE_DSTATE <= 128 else BLOCK_SIZE_K)
     b_ptrs = b_ptr + (offs_m[:, None] * stride_b_seqlen + offs_k[None, :] * stride_b_dstate)

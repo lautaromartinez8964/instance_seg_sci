@@ -126,3 +126,6 @@ mmdet/.mim/
 *.backup
 .owners.yml
 .qodo/
+
+# 输出文件夹（带下划线的）
+outputs_*/

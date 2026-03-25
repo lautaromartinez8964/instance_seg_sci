@@ -42,8 +42,22 @@ class CrossScan_SS2D(nn.Module):
         super().__init__()
         self.d_model = d_model
         
+        # 动态计算能够被整除的 headdim
+        d_ssm = d_model * expand
+        headdim = 64
+        if d_ssm % headdim != 0:
+            headdim = 32
+        if d_ssm % headdim != 0:
+            headdim = 16
+        
         # 只用1个Mamba，但输入是[B, 4*d_model, L]
-        self.mamba = Mamba2(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)        
+        self.mamba = Mamba2(
+            d_model=d_model,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+            headdim=headdim,
+        )
         # 融合层
         self.proj = nn.Linear(d_model, d_model)
         
@@ -54,10 +68,10 @@ class CrossScan_SS2D(nn.Module):
         B, H, W, C = x.shape
         
         # 1. 生成 4 个方向的扫描序列
-        x_h = x.view(B, H * W, C)
-        x_h_flip = x.flip([2]).view(B, H * W, C)
-        x_v = x.transpose(1, 2).contiguous().view(B, W * H, C)
-        x_v_flip = x.transpose(1, 2).flip([2]).contiguous().view(B, W * H, C)
+        x_h = x.contiguous().view(B, H * W, C).contiguous()
+        x_h_flip = x.flip([2]).contiguous().view(B, H * W, C).contiguous()
+        x_v = x.transpose(1, 2).contiguous().view(B, W * H, C).contiguous()
+        x_v_flip = x.transpose(1, 2).flip([2]).contiguous().view(B, W * H, C).contiguous()
         
         # 2. 分别通过 Mamba（共享权重）
         out_h = self.mamba(x_h)
