@@ -28,6 +28,11 @@ try:
 except Exception:
     VMambaBackbone = None
 
+try:
+    from .rs_lightmamba import RSLightMambaBackbone  # noqa: F401
+except Exception:
+    RSLightMambaBackbone = None
+
 __all__ = [
     'RegNet', 'ResNet', 'ResNetV1d', 'ResNeXt', 'SSDVGG', 'HRNet',
     'MobileNetV2', 'Res2Net', 'HourglassNet', 'DetectoRS_ResNet',
@@ -39,3 +44,5 @@ __all__ = [
 ]
 if MM_VMamba is not None:    
     __all__.append('MM_VMamba')
+if RSLightMambaBackbone is not None:
+    __all__.append('RSLightMambaBackbone')

@@ -81,8 +81,22 @@ def main():
     detector_wo_backbone_flops = int(outputs['flops'])
     detector_wo_backbone_params = int(outputs['params'])
 
-    # 2) Backbone FLOPs (official VMamba analytical helper).
-    backbone = Backbone_VSSM(dims=dims, depths=depths, out_indices=(0, 1, 2, 3))
+    # 2) Backbone FLOPs.
+    # For official VMamba configs, pass through the actual backbone kwargs so
+    # analytical params/FLOPs stay aligned with the instantiated detector.
+    if bb_cfg.get('type') in {'MM_VMamba', 'RSLightMambaBackbone'}:
+        backbone_kwargs = {
+            key: value
+            for key, value in bb_cfg.items()
+            if key not in {
+                'type', '_delete_', 'pretrained', 'init_cfg',
+                'official_pretrained', 'pretrained_key', 'strict_pretrained'
+            }
+        }
+        backbone = Backbone_VSSM(**backbone_kwargs)
+    else:
+        backbone = Backbone_VSSM(
+            dims=dims, depths=depths, out_indices=(0, 1, 2, 3))
     backbone_flops = int(backbone.flops(shape=(3, pad_shape[0], pad_shape[1]), verbose=False))
     backbone_params = sum(p.numel() for p in backbone.parameters())
 

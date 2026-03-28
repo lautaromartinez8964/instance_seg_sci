@@ -1,0 +1,6 @@
+- RS-LightMamba research backbone lives in mmdet/models/backbones/rs_lightmamba/lightmamba_backbone.py and inherits official Backbone_VSSM.
+- Active lightweight research config is projects/iSAID/configs/mask_rcnn_rs_lightmamba_fpn_1x_isaid_2241.py with work dir work_dirs/mask_rcnn_rs_lightmamba_fpn_1x_isaid_2241.
+- Auto-resume training entry: scripts/auto_resume_from_latest_epoch.sh <config> <workdir>.
+- Latest-checkpoint unattended evaluation entry: scripts/eval_latest_checkpoint.sh <config> <workdir> [out_pkl].
+- Current tmux session name for 2241 run: rs_lightmamba_2241_auto.
+- Static 2241 efficiency metrics already recorded in study/各模型指标.md: Params 24.861M, FLOPs 143G, FPS 20.8, latency 48.1 ms/img, CUDA memory 984 MB.

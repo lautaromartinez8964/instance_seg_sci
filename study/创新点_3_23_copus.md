@@ -39,7 +39,7 @@ RS-LightMamba: Efficient Remote Sensing Instance Segmentation via Dynamic Scan O
 
 ## 2. 一句话核心
 
-> 我们用一个 ~20M 参数的轻量 Mamba 编码器替代 SAM 的 ~600M ViT 编码器，通过 **前景感知的动态扫描顺序（FG-IG-Scan）**、**轻量频域边界增强（FGEB）**和 **Backbone+FPN 一体化蒸馏（Integral Distillation）**，在遥感实例分割中实现接近大模型精度、5-10× 推理加速。
+fg> 我们用一个 ~20M 参数的轻量 Mamba 编码器替代 SAM 的 ~600M ViT 编码器，通过 **前景感知的动态扫描顺序（FG-IG-Scan）**、**轻量频域边界增强（FGEB）**和 **Backbone+FPN 一体化蒸馏（Integral Distillation）**，在遥感实例分割中实现接近大模型精度、5-10× 推理加速。
 
 ---
 

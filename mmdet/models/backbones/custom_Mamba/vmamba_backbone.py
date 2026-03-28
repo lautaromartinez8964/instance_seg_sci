@@ -20,6 +20,7 @@ class VMambaBackbone(VSSM_Official):
         self,
         out_indices=(0, 1, 2, 3), # 关键1：多尺度输出接口 0：浅层特征 3：最深层，最小分辨率
         pretrained=None,
+        pretrained_adapter=None,
         frozen_stages=-1,
         norm_layer='ln2d',
         **kwargs
@@ -28,6 +29,7 @@ class VMambaBackbone(VSSM_Official):
         
         self.out_indices = out_indices
         self.frozen_stages = frozen_stages
+        self.pretrained_adapter = pretrained_adapter
         
         # 关键2：归一化层的动态添加
         # 为每个输出层添加 norm (OpenCD 规范)
@@ -50,7 +52,7 @@ class VMambaBackbone(VSSM_Official):
         
         # 关键3：加载预训练权重
         if pretrained: 
-            self.load_pretrained(pretrained)
+            self.load_pretrained(pretrained, adapter=pretrained_adapter)
         
         # 关键5：冻结指定层 这里为0，1，2，-1（冻结stage0， stage0，1 ，stage0，1，2； -1为解冻）
         self._freeze_stages()
@@ -67,23 +69,121 @@ class VMambaBackbone(VSSM_Official):
             for param in m.parameters():
                 param.requires_grad = False
     
-    def load_pretrained(self, ckpt_path):
+    @staticmethod
+    def _copy_with_overlap(src, dst):
+        """Copy overlapping weights from src to dst, slicing larger tensors."""
+        out = dst.clone()
+        out.zero_()
+
+        src_slices = []
+        dst_slices = []
+        for dim, (src_size, dst_size) in enumerate(zip(src.shape, dst.shape)):
+            copy_size = min(src_size, dst_size)
+            if src.ndim >= 4 and dim >= src.ndim - 2:
+                src_start = (src_size - copy_size) // 2
+                dst_start = (dst_size - copy_size) // 2
+            else:
+                src_start = 0
+                dst_start = 0
+            src_slices.append(slice(src_start, src_start + copy_size))
+            dst_slices.append(slice(dst_start, dst_start + copy_size))
+
+        out[tuple(dst_slices)] = src[tuple(src_slices)].to(dtype=dst.dtype)
+        return out
+
+    def _adapt_official_vmamba_state_dict(self, state_dict):
+        target_state = self.state_dict()
+        adapted_state = {}
+
+        direct_mappings = {
+            'patch_embed.proj.weight': 'patch_embed.0.weight',
+            'patch_embed.proj.bias': 'patch_embed.0.bias',
+            'patch_embed.norm.weight': 'patch_embed.2.weight',
+            'patch_embed.norm.bias': 'patch_embed.2.bias',
+        }
+
+        for target_key, source_key in direct_mappings.items():
+            if source_key in state_dict and target_key in target_state:
+                adapted_state[target_key] = self._copy_with_overlap(
+                    state_dict[source_key], target_state[target_key])
+
+        for layer_idx, layer in enumerate(self.layers):
+            for block_idx, _ in enumerate(layer.blocks):
+                block_pairs = {
+                    f'layers.{layer_idx}.blocks.{block_idx}.norm.weight':
+                    f'layers.{layer_idx}.blocks.{block_idx}.norm.weight',
+                    f'layers.{layer_idx}.blocks.{block_idx}.norm.bias':
+                    f'layers.{layer_idx}.blocks.{block_idx}.norm.bias',
+                    f'layers.{layer_idx}.blocks.{block_idx}.norm2.weight':
+                    f'layers.{layer_idx}.blocks.{block_idx}.norm2.weight',
+                    f'layers.{layer_idx}.blocks.{block_idx}.norm2.bias':
+                    f'layers.{layer_idx}.blocks.{block_idx}.norm2.bias',
+                    f'layers.{layer_idx}.blocks.{block_idx}.mlp.0.weight':
+                    f'layers.{layer_idx}.blocks.{block_idx}.mlp.fc1.weight',
+                    f'layers.{layer_idx}.blocks.{block_idx}.mlp.0.bias':
+                    f'layers.{layer_idx}.blocks.{block_idx}.mlp.fc1.bias',
+                    f'layers.{layer_idx}.blocks.{block_idx}.mlp.2.weight':
+                    f'layers.{layer_idx}.blocks.{block_idx}.mlp.fc2.weight',
+                    f'layers.{layer_idx}.blocks.{block_idx}.mlp.2.bias':
+                    f'layers.{layer_idx}.blocks.{block_idx}.mlp.fc2.bias',
+                    f'layers.{layer_idx}.blocks.{block_idx}.ss2d.mamba.norm.weight':
+                    f'layers.{layer_idx}.blocks.{block_idx}.op.out_norm.weight',
+                    f'layers.{layer_idx}.blocks.{block_idx}.ss2d.mamba.out_proj.weight':
+                    f'layers.{layer_idx}.blocks.{block_idx}.op.out_proj.weight',
+                }
+
+                for target_key, source_key in block_pairs.items():
+                    if source_key in state_dict and target_key in target_state:
+                        adapted_state[target_key] = self._copy_with_overlap(
+                            state_dict[source_key], target_state[target_key])
+
+            downsample_norm_pairs = {
+                f'layers.{layer_idx}.downsample.norm.weight':
+                f'layers.{layer_idx}.downsample.3.weight',
+                f'layers.{layer_idx}.downsample.norm.bias':
+                f'layers.{layer_idx}.downsample.3.bias',
+            }
+            for target_key, source_key in downsample_norm_pairs.items():
+                if source_key in state_dict and target_key in target_state:
+                    adapted_state[target_key] = self._copy_with_overlap(
+                        state_dict[source_key], target_state[target_key])
+
+        return adapted_state
+
+    def load_pretrained(self, ckpt_path, adapter=None):
         """加载预训练权重"""
         try:
-            checkpoint = torch.load(ckpt_path, map_location='cpu')
+            checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=False)
             if 'model' in checkpoint:
                 state_dict = checkpoint['model']
             elif 'state_dict' in checkpoint:
                 state_dict = checkpoint['state_dict']
             else:
                 state_dict = checkpoint
-            
-            # 过滤掉分类头的权重
-            state_dict = {k: v for k, v in state_dict.items() 
-                         if not k.startswith('head')}
-            
+
+            state_dict = {
+                k: v for k, v in state_dict.items()
+                if not k.startswith('head') and not k.startswith('classifier.')
+            }
+
+            if adapter == 'official_vmamba':
+                state_dict = self._adapt_official_vmamba_state_dict(state_dict)
+
             msg = self.load_state_dict(state_dict, strict=False)
+
+            loaded_tensor_count = sum(
+                1 for key in state_dict.keys()
+                if key in self.state_dict() and self.state_dict()[key].shape == state_dict[key].shape)
+            loaded_param_count = sum(v.numel() for k, v in state_dict.items()
+                                     if k in self.state_dict())
+            total_param_count = sum(v.numel() for v in self.state_dict().values())
+
             print(f"✅ Loaded pretrained weights from {ckpt_path}")
+            if adapter == 'official_vmamba':
+                print(
+                    f"Adapter: official_vmamba | loaded params: "
+                    f"{loaded_param_count / 1e6:.3f}M / {total_param_count / 1e6:.3f}M | "
+                    f"loaded tensors: {loaded_tensor_count}")
             print(f"Missing keys: {msg.missing_keys}")
             print(f"Unexpected keys: {msg.unexpected_keys}")
         except Exception as e:
