@@ -1,7 +1,12 @@
+from typing import List, Optional
+
 import torch
+import torch.nn as nn
 from mmdet.registry import MODELS
 
-from mmdet.models.backbones.vmamba_official.vmamba import Backbone_VSSM
+from mmdet.models.backbones.vmamba_official.vmamba import Backbone_VSSM, SS2D
+
+from .ig_ss2d import IGSS2D
 
 
 @MODELS.register_module()
@@ -21,8 +26,19 @@ class RSLightMambaBackbone(Backbone_VSSM):
         official_pretrained=None,
         pretrained_key='model',
         strict_pretrained=False,
+        ig_scan_stages: Optional[List[int]] = None,
+        ig_region_size: int = 4,
+        ig_guidance_scale: float = 0.5,
         **kwargs,
     ):
+        self._ig_scan_stages = sorted(set(ig_scan_stages or []))
+        self._ig_region_size = ig_region_size
+        self._ig_guidance_scale = ig_guidance_scale
+        self._ss2d_defaults = dict(
+            ssm_init=kwargs.get('ssm_init', 'v0'),
+            forward_type=kwargs.get('forward_type', 'v2'),
+        )
+
         # Disable parent preload and use explicit research loader for clarity.
         super().__init__(
             out_indices=out_indices,
@@ -30,6 +46,10 @@ class RSLightMambaBackbone(Backbone_VSSM):
             norm_layer=norm_layer,
             **kwargs,
         )
+
+        if self._ig_scan_stages:
+            self._upgrade_to_ig_scan()
+
         self.pretrained_key = pretrained_key
         self.strict_pretrained = strict_pretrained
 
@@ -39,6 +59,64 @@ class RSLightMambaBackbone(Backbone_VSSM):
                 key=pretrained_key,
                 strict=strict_pretrained,
             )
+
+    def _build_igss2d_from_ss2d(self, old_op: SS2D,
+                                block_idx: int) -> IGSS2D:
+        conv_bias = False
+        d_conv = 1
+        if getattr(old_op, 'with_dconv', False):
+            d_conv = int(old_op.conv2d.kernel_size[0])
+            conv_bias = old_op.conv2d.bias is not None
+
+        dropout = old_op.dropout.p if isinstance(old_op.dropout,
+                                                 nn.Dropout) else 0.0
+        bias = old_op.in_proj.bias is not None
+
+        new_op = IGSS2D(
+            d_model=old_op.d_model,
+            d_state=old_op.d_state,
+            ssm_ratio=(old_op.d_inner / old_op.d_model),
+            dt_rank=old_op.dt_rank,
+            act_layer=type(old_op.act),
+            d_conv=d_conv,
+            conv_bias=conv_bias,
+            dropout=dropout,
+            bias=bias,
+            initialize=self._ss2d_defaults['ssm_init'],
+            forward_type=self._ss2d_defaults['forward_type'],
+            channel_first=old_op.channel_first,
+            region_size=self._ig_region_size,
+            guidance_scale=self._ig_guidance_scale,
+            block_idx=block_idx,
+        )
+
+        old_state = old_op.state_dict()
+        new_state = new_op.state_dict()
+        compatible = {
+            key: value
+            for key, value in old_state.items()
+            if key in new_state and new_state[key].shape == value.shape
+        }
+        new_op.load_state_dict(compatible, strict=False)
+        return new_op
+
+    def _upgrade_to_ig_scan(self):
+        upgraded = 0
+        for stage_idx in self._ig_scan_stages:
+            if stage_idx >= len(self.layers):
+                print(f'[IG-Scan] Warning: stage {stage_idx} does not exist.')
+                continue
+
+            blocks = self.layers[stage_idx].blocks
+            for block_idx, block in enumerate(blocks):
+                if not hasattr(block, 'op') or not isinstance(block.op, SS2D):
+                    continue
+                block.op = self._build_igss2d_from_ss2d(block.op, block_idx)
+                upgraded += 1
+
+        print(
+            f'[IG-Scan] Upgraded {upgraded} VSS blocks in stages '
+            f'{self._ig_scan_stages} with region_size={self._ig_region_size}.')
 
     @staticmethod
     def _copy_overlap(src_tensor: torch.Tensor,
