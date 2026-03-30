@@ -47,19 +47,23 @@ while true; do
   echo "[$(date)] CKPT=${CKPT:-<none>}" | tee -a "$LOG"
 
   if [ -n "$CKPT" ]; then
+    set +e
     python tools/train.py "$CONFIG" \
       --work-dir "$WORKDIR" \
       --resume "$CKPT" \
       --cfg-options $EXTRA_CFG \
       2>&1 | tee -a "$LOG"
+    code=${PIPESTATUS[0]}
+    set -e
   else
+    set +e
     python tools/train.py "$CONFIG" \
       --work-dir "$WORKDIR" \
       --cfg-options $EXTRA_CFG \
       2>&1 | tee -a "$LOG"
+    code=${PIPESTATUS[0]}
+    set -e
   fi
-
-  code=${PIPESTATUS[0]}
   echo "[$(date)] exit code: $code" | tee -a "$LOG"
 
   if [ "$code" -eq 0 ]; then

@@ -28,12 +28,16 @@ class RSLightMambaBackbone(Backbone_VSSM):
         strict_pretrained=False,
         ig_scan_stages: Optional[List[int]] = None,
         ig_region_size: int = 4,
-        ig_guidance_scale: float = 0.5,
+        ig_guidance_scale: float = 0.1,
+        ig_lk_size: int = 7,
+        ig_descending_only: bool = False,
         **kwargs,
     ):
         self._ig_scan_stages = sorted(set(ig_scan_stages or []))
         self._ig_region_size = ig_region_size
         self._ig_guidance_scale = ig_guidance_scale
+        self._ig_lk_size = ig_lk_size
+        self._ig_descending_only = ig_descending_only
         self._ss2d_defaults = dict(
             ssm_init=kwargs.get('ssm_init', 'v0'),
             forward_type=kwargs.get('forward_type', 'v2'),
@@ -87,6 +91,8 @@ class RSLightMambaBackbone(Backbone_VSSM):
             channel_first=old_op.channel_first,
             region_size=self._ig_region_size,
             guidance_scale=self._ig_guidance_scale,
+            lk_size=self._ig_lk_size,
+            descending_only=self._ig_descending_only,
             block_idx=block_idx,
         )
 
