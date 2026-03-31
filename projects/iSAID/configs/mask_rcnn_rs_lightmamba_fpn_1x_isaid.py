@@ -6,10 +6,14 @@ _base_ = [
 ]
 
 custom_imports = dict(
-    imports=['mmdet.models.backbones.rs_lightmamba.lightmamba_backbone'],
+    imports=[
+        'mmdet.models.backbones.rs_lightmamba.lightmamba_backbone',
+        'mmdet.models.detectors.rs_ig_mask_rcnn'
+    ],
     allow_failed_imports=False)
 
 model = dict(
+    type='RSMaskRCNN',
     backbone=dict(
         _delete_=True,
         type='RSLightMambaBackbone',

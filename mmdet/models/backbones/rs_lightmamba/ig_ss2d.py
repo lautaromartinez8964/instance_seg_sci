@@ -19,6 +19,7 @@ class IGSS2D(SS2D):
                  block_idx: int = 0,
                  guidance_scale: float = 0.1,
                  lk_size: int = 7,
+                 fg_loss_weight: float = 0.0,
                  descending_only: bool = False,
                  **kwargs):
         super().__init__(**kwargs)
@@ -28,6 +29,7 @@ class IGSS2D(SS2D):
             region_size=region_size,
             guidance_scale=guidance_scale,
             lk_size=lk_size,
+            fg_loss_weight=fg_loss_weight,
         )
         self.ig_cross = IGCrossScan()
         self.block_idx = block_idx
@@ -39,6 +41,18 @@ class IGSS2D(SS2D):
             self.forward_core_ig,
             **core_keywords,
         )
+
+    def set_fg_target(self, fg_target: torch.Tensor | None) -> None:
+        self.ig_scan_module.set_fg_target(fg_target)
+
+    def clear_fg_target(self) -> None:
+        self.ig_scan_module.clear_fg_target()
+
+    def get_fg_loss(self) -> torch.Tensor | None:
+        return self.ig_scan_module.last_fg_loss
+
+    def reset_runtime_state(self) -> None:
+        self.ig_scan_module.reset_state()
 
     def forward_core_ig(self,
                         x: torch.Tensor = None,

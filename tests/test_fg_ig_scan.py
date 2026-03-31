@@ -74,8 +74,27 @@ def test_gradient_flow_to_fg_head():
     assert scan.fg_head.pw_out.weight.grad is not None
 
 
+def test_foreground_supervision_loss_is_generated():
+    device = _device()
+    scan = FGIGScan(
+        d_inner=16,
+        region_size=4,
+        guidance_scale=0.1,
+        fg_loss_weight=0.2).to(device)
+    x = torch.randn(2, 16, 16, 16, device=device)
+    fg_target = torch.zeros(2, 1, 32, 32, device=device)
+    fg_target[:, :, 8:24, 8:24] = 1.0
+    scan.set_fg_target(fg_target)
+
+    scan.compute_region_order(x, descending=True)
+
+    assert scan.last_fg_loss is not None
+    assert scan.last_fg_loss.item() > 0
+
+
 if __name__ == '__main__':
     test_shape_preservation()
     test_identity_order_matches_official_scan0()
     test_gradient_flow_to_fg_head()
+    test_foreground_supervision_loss_is_generated()
     print('ALL TESTS PASSED')

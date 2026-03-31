@@ -10,4 +10,4 @@ model = dict(
         ig_fg_loss_weight=0.2,
         ig_descending_only=True))
 
-work_dir = 'work_dirs/mask_rcnn_rs_lightmamba_ig_scan_v2_fpn_1x_isaid'
+work_dir = 'work_dirs/mask_rcnn_rs_lightmamba_ig_scan_v3_fpn_1x_isaid'

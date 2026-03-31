@@ -96,18 +96,22 @@ class FGIGScan(nn.Module):
                  d_inner: int,
                  region_size: int = 4,
                  guidance_scale: float = 0.1,
-                 lk_size: int = 7):
+                 lk_size: int = 7,
+                 fg_loss_weight: float = 0.0):
         super().__init__()
         self.fg_head = ForegroundHead(d_inner, lk_size=lk_size)
         self.region_size = region_size
+        self.fg_loss_weight = float(max(fg_loss_weight, 0.0))
         guidance_scale = float(max(min(guidance_scale, 1 - 1e-4), 1e-4))
         self._guidance_scale_raw = nn.Parameter(
             torch.logit(torch.tensor(guidance_scale)))
 
+        self.current_fg_target: Optional[torch.Tensor] = None
         self.last_importance: Optional[torch.Tensor] = None
         self.last_order: Optional[torch.Tensor] = None
         self.last_region_scores: Optional[torch.Tensor] = None
         self.last_grid_shape: Optional[Tuple[int, int]] = None
+        self.last_fg_loss: Optional[torch.Tensor] = None
 
     @property
     def guidance_scale(self) -> torch.Tensor:
@@ -118,6 +122,33 @@ class FGIGScan(nn.Module):
         self.last_order = None
         self.last_region_scores = None
         self.last_grid_shape = None
+        self.last_fg_loss = None
+
+    def set_fg_target(self, fg_target: Optional[torch.Tensor]) -> None:
+        self.current_fg_target = fg_target
+
+    def clear_fg_target(self) -> None:
+        self.current_fg_target = None
+
+    def _compute_fg_loss(self, importance: torch.Tensor) -> Optional[torch.Tensor]:
+        if self.current_fg_target is None or self.fg_loss_weight <= 0:
+            return None
+
+        fg_target = self.current_fg_target.to(
+            device=importance.device, dtype=importance.dtype)
+        if fg_target.shape[-2:] != importance.shape[-2:]:
+            fg_target = F.interpolate(
+                fg_target,
+                size=importance.shape[-2:],
+                mode='nearest')
+
+        # BCE on probabilities is not autocast-safe. Compute it in FP32 and
+        # return the scaled scalar to the mixed-precision training loop.
+        with torch.amp.autocast(device_type=importance.device.type, enabled=False):
+            loss = F.binary_cross_entropy(
+                importance.float(),
+                fg_target.float())
+        return loss * self.fg_loss_weight
 
     def compute_region_order(
         self,
@@ -130,6 +161,7 @@ class FGIGScan(nn.Module):
         _, _, height, width = x.shape
         gh, gw = _get_divisible_grid(height, width, self.region_size)
         importance = self.fg_head(x)
+        self.last_fg_loss = self._compute_fg_loss(importance)
         scores = compute_region_scores(importance, gh, gw)
         order = get_region_order(scores, descending=descending)
 
