@@ -20,6 +20,8 @@ class IGSS2D(SS2D):
                  guidance_scale: float = 0.1,
                  lk_size: int = 7,
                  fg_loss_weight: float = 0.0,
+                 ig_mode: str = 'scan',
+                 gate_scale: float = 0.1,
                  descending_only: bool = False,
                  **kwargs):
         super().__init__(**kwargs)
@@ -34,13 +36,24 @@ class IGSS2D(SS2D):
         self.ig_cross = IGCrossScan()
         self.block_idx = block_idx
         self.descending_only = descending_only
-        core_keywords = dict(getattr(original_forward_core, 'keywords', {}) or {})
-        core_keywords.setdefault('force_fp32', (not self.disable_force32))
-        core_keywords.setdefault('selective_scan_backend', 'mamba')
-        self.forward_core = partial(
-            self.forward_core_ig,
-            **core_keywords,
-        )
+        self.ig_mode = ig_mode
+        self.gate_scale = torch.nn.Parameter(
+            torch.tensor(float(max(gate_scale, 0.0)), dtype=torch.float32))
+        self._official_forward_core = original_forward_core
+
+        if self.ig_mode not in {'scan', 'z_gate'}:
+            raise ValueError(f'Unsupported ig_mode: {self.ig_mode}')
+        if self.ig_mode == 'z_gate' and self.disable_z:
+            raise ValueError('ig_mode="z_gate" requires z gating, but forward_type disables z.')
+
+        if self.ig_mode == 'scan':
+            core_keywords = dict(getattr(original_forward_core, 'keywords', {}) or {})
+            core_keywords.setdefault('force_fp32', (not self.disable_force32))
+            core_keywords.setdefault('selective_scan_backend', 'mamba')
+            self.forward_core = partial(
+                self.forward_core_ig,
+                **core_keywords,
+            )
 
     def set_fg_target(self, fg_target: torch.Tensor | None) -> None:
         self.ig_scan_module.set_fg_target(fg_target)
@@ -128,6 +141,7 @@ class IGSS2D(SS2D):
         return y.to(x.dtype)
 
     def forwardv2(self, x: torch.Tensor, **kwargs):
+        del kwargs
         x = self.in_proj(x)
         if not self.disable_z:
             x, z = x.chunk(2, dim=(1 if self.channel_first else -1))
@@ -138,8 +152,17 @@ class IGSS2D(SS2D):
         if self.with_dconv:
             x = self.conv2d(x)
         x = self.act(x)
+
+        importance = None
+        if self.ig_mode == 'z_gate':
+            importance = self.ig_scan_module.predict_importance(x)
+
         y = self.forward_core(x)
         y = self.out_act(y)
         if not self.disable_z:
+            if self.ig_mode == 'z_gate' and importance is not None:
+                z_importance = importance if self.channel_first else importance.permute(
+                    0, 2, 3, 1).contiguous()
+                z = z * (1.0 + torch.clamp(self.gate_scale, min=0.0) * z_importance)
             y = y * z
         return self.dropout(self.out_proj(y))

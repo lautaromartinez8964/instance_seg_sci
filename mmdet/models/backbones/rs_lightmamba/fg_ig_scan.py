@@ -130,6 +130,15 @@ class FGIGScan(nn.Module):
     def clear_fg_target(self) -> None:
         self.current_fg_target = None
 
+    def predict_importance(self, x: torch.Tensor) -> torch.Tensor:
+        importance = self.fg_head(x)
+        self.last_fg_loss = self._compute_fg_loss(importance)
+        self.last_importance = importance
+        self.last_order = None
+        self.last_region_scores = None
+        self.last_grid_shape = None
+        return importance
+
     def _compute_fg_loss(self, importance: torch.Tensor) -> Optional[torch.Tensor]:
         if self.current_fg_target is None or self.fg_loss_weight <= 0:
             return None
@@ -160,8 +169,7 @@ class FGIGScan(nn.Module):
 
         _, _, height, width = x.shape
         gh, gw = _get_divisible_grid(height, width, self.region_size)
-        importance = self.fg_head(x)
-        self.last_fg_loss = self._compute_fg_loss(importance)
+        importance = self.predict_importance(x)
         scores = compute_region_scores(importance, gh, gw)
         order = get_region_order(scores, descending=descending)
 

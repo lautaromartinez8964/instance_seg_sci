@@ -31,6 +31,8 @@ class RSLightMambaBackbone(Backbone_VSSM):
         ig_guidance_scale: float = 0.1,
         ig_lk_size: int = 7,
         ig_descending_only: bool = False,
+        ig_mode: str = 'scan',
+        ig_gate_scale: float = 0.1,
         ig_use_fg_loss: bool = False,
         ig_fg_loss_weight: float = 0.0,
         **kwargs,
@@ -40,6 +42,8 @@ class RSLightMambaBackbone(Backbone_VSSM):
         self._ig_guidance_scale = ig_guidance_scale
         self._ig_lk_size = ig_lk_size
         self._ig_descending_only = ig_descending_only
+        self._ig_mode = ig_mode
+        self._ig_gate_scale = ig_gate_scale
         self._ig_use_fg_loss = ig_use_fg_loss
         self._ig_fg_loss_weight = ig_fg_loss_weight
         self._ss2d_defaults = dict(
@@ -98,6 +102,8 @@ class RSLightMambaBackbone(Backbone_VSSM):
             guidance_scale=self._ig_guidance_scale,
             lk_size=self._ig_lk_size,
             fg_loss_weight=(self._ig_fg_loss_weight if self._ig_use_fg_loss else 0.0),
+            ig_mode=self._ig_mode,
+            gate_scale=self._ig_gate_scale,
             descending_only=self._ig_descending_only,
             block_idx=block_idx,
         )
@@ -130,7 +136,8 @@ class RSLightMambaBackbone(Backbone_VSSM):
 
         print(
             f'[IG-Scan] Upgraded {upgraded} VSS blocks in stages '
-            f'{self._ig_scan_stages} with region_size={self._ig_region_size}.')
+            f'{self._ig_scan_stages} with mode={self._ig_mode}, '
+            f'region_size={self._ig_region_size}.')
 
     @staticmethod
     def _copy_overlap(src_tensor: torch.Tensor,
@@ -180,6 +187,19 @@ class RSLightMambaBackbone(Backbone_VSSM):
         }
         return filtered
 
+    @staticmethod
+    def _expand_in_proj_tensor(src_tensor: torch.Tensor,
+                               dst_tensor: torch.Tensor) -> torch.Tensor | None:
+        if src_tensor.ndim == 2:
+            if dst_tensor.shape[0] != src_tensor.shape[0] * 2 or dst_tensor.shape[1] != src_tensor.shape[1]:
+                return None
+            return torch.cat([src_tensor, src_tensor], dim=0).to(dst_tensor.dtype)
+        if src_tensor.ndim == 1:
+            if dst_tensor.shape[0] != src_tensor.shape[0] * 2:
+                return None
+            return torch.cat([src_tensor, src_tensor], dim=0).to(dst_tensor.dtype)
+        return None
+
     def load_official_pretrained(self,
                                  ckpt_path: str,
                                  key: str = 'model',
@@ -197,6 +217,12 @@ class RSLightMambaBackbone(Backbone_VSSM):
             if k not in src_state:
                 continue
             src_v = src_state[k]
+            if k.endswith('in_proj.weight') or k.endswith('in_proj.bias'):
+                expanded = self._expand_in_proj_tensor(src_v, dst_v)
+                if expanded is not None:
+                    merged[k] = expanded
+                    exact_params += dst_v.numel()
+                    continue
             if src_v.shape == dst_v.shape:
                 merged[k] = src_v.to(dst_v.dtype)
                 exact_params += dst_v.numel()

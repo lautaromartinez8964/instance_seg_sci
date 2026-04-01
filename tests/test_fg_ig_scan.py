@@ -92,9 +92,22 @@ def test_foreground_supervision_loss_is_generated():
     assert scan.last_fg_loss.item() > 0
 
 
+def test_predict_importance_updates_runtime_state():
+    device = _device()
+    scan = FGIGScan(d_inner=16, region_size=4, guidance_scale=0.1).to(device)
+    x = torch.randn(1, 16, 8, 8, device=device)
+
+    importance = scan.predict_importance(x)
+
+    assert importance.shape == (1, 1, 8, 8)
+    assert scan.last_importance is not None
+    assert scan.last_order is None
+
+
 if __name__ == '__main__':
     test_shape_preservation()
     test_identity_order_matches_official_scan0()
     test_gradient_flow_to_fg_head()
     test_foreground_supervision_loss_is_generated()
+    test_predict_importance_updates_runtime_state()
     print('ALL TESTS PASSED')
