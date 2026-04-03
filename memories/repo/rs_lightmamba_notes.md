@@ -1,0 +1,2 @@
+- Official VMamba cross_scan_fn in v05/v05_noz path requires CUDA; CPU smoke tests can fail with "Expected a cuda device" even when the code is otherwise correct.
+- For RS-LightMamba IG experiments, backbone smoke validation should use mmdec env and a small CUDA input such as 224x224.

@@ -7,6 +7,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _resolve_group_count(num_channels: int, max_groups: int = 8) -> int:
+    max_groups = max(1, min(max_groups, num_channels))
+    for group_count in range(max_groups, 0, -1):
+        if num_channels % group_count == 0:
+            return group_count
+    return 1
+
+
 def _stable_argsort(scores: torch.Tensor, descending: bool) -> torch.Tensor:
     try:
         return torch.argsort(
@@ -23,11 +31,26 @@ def _stable_argsort(scores: torch.Tensor, descending: bool) -> torch.Tensor:
 class ForegroundHead(nn.Module):
     """Large-kernel bottleneck importance predictor."""
 
-    def __init__(self, d_inner: int, lk_size: int = 7, reduction: int = 4):
+    def __init__(self,
+                 d_inner: int,
+                 lk_size: int = 7,
+                 reduction: int = 4,
+                 norm_type: str = 'bn',
+                 gn_groups: int = 8):
         super().__init__()
         mid_channels = max(d_inner // reduction, 16)
+        norm_type = norm_type.lower()
+        if norm_type not in {'bn', 'gn'}:
+            raise ValueError(f'Unsupported norm_type: {norm_type}')
+
+        def build_norm() -> nn.Module:
+            if norm_type == 'gn':
+                return nn.GroupNorm(_resolve_group_count(mid_channels, gn_groups),
+                                    mid_channels)
+            return nn.BatchNorm2d(mid_channels)
+
         self.pw_down = nn.Conv2d(d_inner, mid_channels, 1, bias=False)
-        self.bn1 = nn.BatchNorm2d(mid_channels)
+        self.bn1 = build_norm()
         self.dw_large = nn.Conv2d(
             mid_channels,
             mid_channels,
@@ -36,9 +59,9 @@ class ForegroundHead(nn.Module):
             groups=mid_channels,
             bias=False,
         )
-        self.bn2 = nn.BatchNorm2d(mid_channels)
+        self.bn2 = build_norm()
         self.pw_mix = nn.Conv2d(mid_channels, mid_channels, 1, bias=False)
-        self.bn3 = nn.BatchNorm2d(mid_channels)
+        self.bn3 = build_norm()
         self.dw_refine = nn.Conv2d(
             mid_channels,
             mid_channels,
@@ -47,7 +70,7 @@ class ForegroundHead(nn.Module):
             groups=mid_channels,
             bias=False,
         )
-        self.bn4 = nn.BatchNorm2d(mid_channels)
+        self.bn4 = build_norm()
         self.pw_out = nn.Conv2d(mid_channels, 1, 1, bias=True)
         nn.init.constant_(self.pw_out.bias, 0.0)
         self.act = nn.SiLU(inplace=False)
@@ -97,9 +120,15 @@ class FGIGScan(nn.Module):
                  region_size: int = 4,
                  guidance_scale: float = 0.1,
                  lk_size: int = 7,
-                 fg_loss_weight: float = 0.0):
+                 fg_loss_weight: float = 0.0,
+                 fg_norm_type: str = 'bn',
+                 fg_gn_groups: int = 8):
         super().__init__()
-        self.fg_head = ForegroundHead(d_inner, lk_size=lk_size)
+        self.fg_head = ForegroundHead(
+            d_inner,
+            lk_size=lk_size,
+            norm_type=fg_norm_type,
+            gn_groups=fg_gn_groups)
         self.region_size = region_size
         self.fg_loss_weight = float(max(fg_loss_weight, 0.0))
         guidance_scale = float(max(min(guidance_scale, 1 - 1e-4), 1e-4))

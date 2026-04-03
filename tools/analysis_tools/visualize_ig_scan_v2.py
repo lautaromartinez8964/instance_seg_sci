@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image, ImageDraw
 
 os.environ.setdefault('TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD', '1')
@@ -87,6 +88,38 @@ def draw_grid_labels(canvas: Image.Image, rank_map: dict[int, int],
             draw.rectangle((left + 2, top + 2, left + 72, top + 30), fill=(0, 0, 0, 140))
             draw.text((left + 6, top + 5), f'R{rank}', fill=(255, 255, 255, 255))
             draw.text((left + 34, top + 5), f'{score:.2f}', fill=(255, 230, 80, 255))
+
+
+def infer_grid_shape(height: int, width: int, region_size: int) -> tuple[int, int]:
+    gh = max(height // region_size, 1)
+    gw = max(width // region_size, 1)
+    gh = min(gh, height)
+    gw = min(gw, width)
+
+    while gh > 1 and height % gh != 0:
+        gh -= 1
+    while gw > 1 and width % gw != 0:
+        gw -= 1
+    return gh, gw
+
+
+def derive_region_state(module: IGSS2D, importance: torch.Tensor):
+    grid_shape = module.ig_scan_module.last_grid_shape
+    region_scores = module.ig_scan_module.last_region_scores
+    order = module.ig_scan_module.last_order
+
+    if grid_shape is None:
+        _, _, height, width = importance.shape
+        grid_shape = infer_grid_shape(height, width, module.ig_scan_module.region_size)
+
+    if region_scores is None:
+        gh, gw = grid_shape
+        region_scores = F.adaptive_avg_pool2d(importance, (gh, gw)).flatten(1)
+
+    if order is None:
+        order = torch.argsort(region_scores, dim=-1, descending=True)
+
+    return order, region_scores, grid_shape
 
 
 def save_importance_overlay(image_path: Path, importance: torch.Tensor,
@@ -197,11 +230,10 @@ def main():
         inference_detector(model, args.image)
 
     importance = target_module.ig_scan_module.last_importance
-    order = target_module.ig_scan_module.last_order
-    region_scores = target_module.ig_scan_module.last_region_scores
-    grid_shape = target_module.ig_scan_module.last_grid_shape
-    if importance is None or order is None or region_scores is None or grid_shape is None:
+    if importance is None:
         raise RuntimeError('IG-Scan state was not captured during inference.')
+
+    order, region_scores, grid_shape = derive_region_state(target_module, importance)
 
     gh, gw = grid_shape
     save_importance_overlay(

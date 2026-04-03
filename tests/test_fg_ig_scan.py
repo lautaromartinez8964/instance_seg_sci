@@ -3,6 +3,7 @@ import importlib.util
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 
 sys.path.insert(0, '.')
 
@@ -104,10 +105,26 @@ def test_predict_importance_updates_runtime_state():
     assert scan.last_order is None
 
 
+def test_foreground_head_supports_group_norm():
+    device = _device()
+    scan = FGIGScan(
+        d_inner=32,
+        region_size=4,
+        guidance_scale=0.1,
+        fg_norm_type='gn',
+        fg_gn_groups=8).to(device)
+
+    assert isinstance(scan.fg_head.bn1, nn.GroupNorm)
+    assert isinstance(scan.fg_head.bn2, nn.GroupNorm)
+    assert isinstance(scan.fg_head.bn3, nn.GroupNorm)
+    assert isinstance(scan.fg_head.bn4, nn.GroupNorm)
+
+
 if __name__ == '__main__':
     test_shape_preservation()
     test_identity_order_matches_official_scan0()
     test_gradient_flow_to_fg_head()
     test_foreground_supervision_loss_is_generated()
     test_predict_importance_updates_runtime_state()
+    test_foreground_head_supports_group_norm()
     print('ALL TESTS PASSED')

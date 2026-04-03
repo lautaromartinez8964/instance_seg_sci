@@ -33,6 +33,10 @@ class RSLightMambaBackbone(Backbone_VSSM):
         ig_descending_only: bool = False,
         ig_mode: str = 'scan',
         ig_gate_scale: float = 0.1,
+        ig_dt_scale: float = 0.03,
+        ig_gate_mode: str = 'positive',
+        ig_fg_norm_type: str = 'bn',
+        ig_fg_gn_groups: int = 8,
         ig_use_fg_loss: bool = False,
         ig_fg_loss_weight: float = 0.0,
         **kwargs,
@@ -44,6 +48,10 @@ class RSLightMambaBackbone(Backbone_VSSM):
         self._ig_descending_only = ig_descending_only
         self._ig_mode = ig_mode
         self._ig_gate_scale = ig_gate_scale
+        self._ig_dt_scale = ig_dt_scale
+        self._ig_gate_mode = ig_gate_mode
+        self._ig_fg_norm_type = ig_fg_norm_type
+        self._ig_fg_gn_groups = ig_fg_gn_groups
         self._ig_use_fg_loss = ig_use_fg_loss
         self._ig_fg_loss_weight = ig_fg_loss_weight
         self._ss2d_defaults = dict(
@@ -102,8 +110,12 @@ class RSLightMambaBackbone(Backbone_VSSM):
             guidance_scale=self._ig_guidance_scale,
             lk_size=self._ig_lk_size,
             fg_loss_weight=(self._ig_fg_loss_weight if self._ig_use_fg_loss else 0.0),
+            fg_norm_type=self._ig_fg_norm_type,
+            fg_gn_groups=self._ig_fg_gn_groups,
             ig_mode=self._ig_mode,
             gate_scale=self._ig_gate_scale,
+            dt_scale=self._ig_dt_scale,
+            gate_mode=self._ig_gate_mode,
             descending_only=self._ig_descending_only,
             block_idx=block_idx,
         )

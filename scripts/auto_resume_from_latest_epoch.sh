@@ -4,7 +4,7 @@ set -o pipefail
 
 CONFIG="${1:-projects/iSAID/configs/mask_rcnn_r50_fpn_1x_isaid.py}"
 WORKDIR="${2:-work_dirs/mask_rcnn_r50_fpn_1x_isaid}"
-EXTRA_CFG="${3:-train_dataloader.num_workers=0 train_dataloader.persistent_workers=False val_dataloader.num_workers=0 val_dataloader.persistent_workers=False test_dataloader.num_workers=0 test_dataloader.persistent_workers=False train_cfg.val_interval=9999}"
+EXTRA_CFG="${3:-train_dataloader.num_workers=0 train_dataloader.persistent_workers=False val_dataloader.num_workers=0 val_dataloader.persistent_workers=False test_dataloader.num_workers=0 test_dataloader.persistent_workers=False train_cfg.val_interval=2}"
 TRAIN_ARGS="${4:-}"
 
 cd ~/projects/mmdetection || exit 1
