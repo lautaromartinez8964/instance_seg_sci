@@ -3,6 +3,7 @@ from __future__ import annotations
 from functools import partial
 
 import torch
+import torch.nn.functional as F
 
 from mmdet.models.backbones.vmamba_official.vmamba import SS2D, cross_merge_fn, cross_scan_fn
 from mmdet.models.backbones.vmamba_official.csms6s import selective_scan_fn
@@ -26,9 +27,12 @@ def apply_importance_to_z(z: torch.Tensor,
 
 def apply_importance_to_dt(dts: torch.Tensor,
                            importance: torch.Tensor,
-                           dt_scale: torch.Tensor) -> torch.Tensor:
+                           dt_scale: torch.Tensor,
+                           dt_bias: torch.Tensor) -> torch.Tensor:
     safe_dt_scale = torch.clamp(dt_scale, min=0.0)
-    return dts + safe_dt_scale * importance.to(dtype=dts.dtype)
+    effective_dt = F.softplus(dts + dt_bias.to(dtype=dts.dtype))
+    dt_factor = 1.0 + safe_dt_scale * importance.to(dtype=dts.dtype)
+    return effective_dt * dt_factor
 
 
 class IGSS2D(SS2D):
@@ -155,6 +159,8 @@ class IGSS2D(SS2D):
                                    self.dt_projs_weight)
 
         dts = dts.contiguous().view(batch_size, k_group, -1, seq_len)
+        delta_bias = self.dt_projs_bias.view(1, k_group, -1, 1)
+        delta_softplus = True
         if self.ig_mode == 'dt_gate':
             importance = self.ig_scan_module.predict_importance(x)
             importance_seq = cross_scan_fn(
@@ -163,7 +169,13 @@ class IGSS2D(SS2D):
                 out_channel_first=True,
                 scans=0,
                 force_torch=False).view(batch_size, k_group, 1, seq_len)
-            dts = apply_importance_to_dt(dts, importance_seq, self.dt_scale)
+            dts = apply_importance_to_dt(
+                dts,
+                importance_seq,
+                self.dt_scale,
+                delta_bias)
+            delta_bias = None
+            delta_softplus = False
 
         xs = xs.view(batch_size, -1, seq_len)
         dts = dts.contiguous().view(batch_size, -1, seq_len)
@@ -171,7 +183,8 @@ class IGSS2D(SS2D):
         Ds = self.Ds.to(torch.float)
         Bs = Bs.contiguous().view(batch_size, k_group, state_dim, seq_len)
         Cs = Cs.contiguous().view(batch_size, k_group, state_dim, seq_len)
-        delta_bias = self.dt_projs_bias.view(-1).to(torch.float)
+        if delta_bias is not None:
+            delta_bias = delta_bias.view(-1).to(torch.float)
 
         if force_fp32:
             xs = xs.to(torch.float32)
@@ -180,7 +193,7 @@ class IGSS2D(SS2D):
             Cs = Cs.to(torch.float32)
 
         ys = selective_scan_fn(
-            xs, dts, As, Bs, Cs, Ds, delta_bias, True, ssoflex,
+            xs, dts, As, Bs, Cs, Ds, delta_bias, delta_softplus, ssoflex,
             backend=selective_scan_backend).view(batch_size, k_group, -1, seq_len)
 
         if self.ig_mode == 'scan':

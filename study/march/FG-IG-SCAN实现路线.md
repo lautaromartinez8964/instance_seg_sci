@@ -474,16 +474,20 @@ v5a 明确采用“先验证机制，再优化信号”的顺序。
 4. `fg_head` 继续使用 v4-b 的 `GroupNorm` 版本。
 5. `loss_fg` 继续使用当前 union mask + BCE。
 6. 新增一个可学习标量 `dt_scale`，初始化为 0.03。
-7. 在官方 cross scan 路径下，对 scan 后的 `dts` 做逐位置加性调制。
+7. 在官方 cross scan 路径下，对有效 dt 做逐位置乘性调制。
 
 对应的最小形式为：
 
-`dts = dts + beta * importance`
+`dt_eff = softplus(dts + bias)`
 
-这里选择加性而不是直接对原始 `dts` 做乘性放大，主要出于两点考虑：
+`dt_eff' = dt_eff * (1 + beta * importance)`
 
-1. selective scan 内部最终使用的是带 bias 的 softplus 形式，softplus 对输入单调递增，因此加性正偏置更直接对应“让有效 dt 变大”。
-2. 对 raw `dts` 乘性放大在其取负值时不保证单调增加，而加性正偏置更符合 v5a 对“前景区域 dt 稍大”的设计目标。
+这里强调的是“对有效 dt 乘法调制”，而不是“对 raw dts 乘法调制”。
+
+这样处理主要出于两点考虑：
+
+1. selective scan 内部真正起作用的是 `softplus(dts + bias)` 之后的有效 dt，而不是 raw `dts` 本身。
+2. 若直接对 raw `dts` 做乘法放大，当某些通道的 raw `dts` 为负时，乘以大于 1 的系数反而可能让有效 dt 变小；而在有效 dt 空间做乘法，则能同时保证前景区域单调增强和各通道相对变化一致。
 
 ### 8.5 v5a 的实现流程
 
@@ -493,8 +497,8 @@ v5a 的前向流程可概括为：
 2. foreground head 在该特征上预测一个粗粒度 importance map。
 3. 主分支继续走官方 `cross_scan`，不再做区域重排。
 4. 将 importance 通过同样的 `cross_scan` 展平到四个扫描方向。
-5. 在送入 `selective_scan_fn` 之前，对 `dts` 施加 `beta * importance` 的加性偏置。
-6. 后续 selective scan、cross merge、输出归一化全部保持官方路径。
+5. 在送入 `selective_scan_fn` 之前，先显式计算有效 dt，再施加 `(1 + beta * importance)` 的乘性缩放。
+6. 之后以 `delta_softplus=False` 的形式将该有效 dt 送入 selective scan，其余 cross merge 和输出归一化全部保持官方路径。
 
 这版设计回答的核心问题是：
 
