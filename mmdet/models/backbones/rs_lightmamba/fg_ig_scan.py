@@ -178,7 +178,8 @@ class FGIGScan(nn.Module):
             fg_target = F.interpolate(
                 fg_target,
                 size=importance.shape[-2:],
-                mode='nearest')
+                mode='area')
+            fg_target = (fg_target > 0).to(dtype=importance.dtype)
 
         # BCE on probabilities is not autocast-safe. Compute it in FP32 and
         # return the scaled scalar to the mixed-precision training loop.

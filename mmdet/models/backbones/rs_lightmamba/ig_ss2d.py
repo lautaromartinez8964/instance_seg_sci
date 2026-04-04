@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from functools import partial
+import math
 
 import torch
 import torch.nn.functional as F
@@ -10,6 +11,11 @@ from mmdet.models.backbones.vmamba_official.csms6s import selective_scan_fn
 
 from .fg_ig_scan import FGIGScan
 from .ig_cross_scan import IGCrossScan
+
+
+def _inverse_softplus(value: float) -> float:
+    value = float(max(value, 1e-6))
+    return value + math.log(-math.expm1(-value))
 
 
 def apply_importance_to_z(z: torch.Tensor,
@@ -29,7 +35,7 @@ def apply_importance_to_dt(dts: torch.Tensor,
                            importance: torch.Tensor,
                            dt_scale: torch.Tensor,
                            dt_bias: torch.Tensor) -> torch.Tensor:
-    safe_dt_scale = torch.clamp(dt_scale, min=0.0)
+    safe_dt_scale = dt_scale.to(dtype=dts.dtype)
     effective_dt = F.softplus(dts + dt_bias.to(dtype=dts.dtype))
     dt_factor = 1.0 + safe_dt_scale * importance.to(dtype=dts.dtype)
     return effective_dt * dt_factor
@@ -70,8 +76,9 @@ class IGSS2D(SS2D):
         self.gate_mode = gate_mode
         self.gate_scale = torch.nn.Parameter(
             torch.tensor(float(max(gate_scale, 0.0)), dtype=torch.float32))
-        self.dt_scale = torch.nn.Parameter(
-            torch.tensor(float(max(dt_scale, 0.0)), dtype=torch.float32))
+        self.dt_scale_raw = torch.nn.Parameter(
+            torch.tensor(_inverse_softplus(max(dt_scale, 1e-6)),
+                         dtype=torch.float32))
         self._official_forward_core = original_forward_core
 
         if self.ig_mode not in {'scan', 'z_gate', 'dt_gate'}:
@@ -89,6 +96,10 @@ class IGSS2D(SS2D):
                 self.forward_core_ig,
                 **core_keywords,
             )
+
+    @property
+    def dt_scale(self) -> torch.Tensor:
+        return F.softplus(self.dt_scale_raw)
 
     def set_fg_target(self, fg_target: torch.Tensor | None) -> None:
         self.ig_scan_module.set_fg_target(fg_target)

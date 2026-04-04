@@ -4,6 +4,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 sys.path.insert(0, '.')
 
@@ -93,6 +94,27 @@ def test_foreground_supervision_loss_is_generated():
     assert scan.last_fg_loss.item() > 0
 
 
+def test_area_downsample_preserves_tiny_foreground():
+    device = _device()
+    scan = FGIGScan(
+        d_inner=16,
+        region_size=4,
+        guidance_scale=0.1,
+        fg_loss_weight=1.0).to(device)
+    importance = torch.full((1, 1, 8, 8), 0.1, device=device)
+    fg_target = torch.zeros(1, 1, 32, 32, device=device)
+    fg_target[:, :, 3, 3] = 1.0
+    scan.set_fg_target(fg_target)
+
+    loss = scan._compute_fg_loss(importance)
+    expected_target = torch.zeros_like(importance)
+    expected_target[:, :, 0, 0] = 1.0
+    expected = F.binary_cross_entropy(importance.float(), expected_target.float())
+
+    assert loss is not None
+    assert torch.allclose(loss, expected, atol=1e-6)
+
+
 def test_predict_importance_updates_runtime_state():
     device = _device()
     scan = FGIGScan(d_inner=16, region_size=4, guidance_scale=0.1).to(device)
@@ -125,6 +147,7 @@ if __name__ == '__main__':
     test_identity_order_matches_official_scan0()
     test_gradient_flow_to_fg_head()
     test_foreground_supervision_loss_is_generated()
+    test_area_downsample_preserves_tiny_foreground()
     test_predict_importance_updates_runtime_state()
     test_foreground_head_supports_group_norm()
     print('ALL TESTS PASSED')
