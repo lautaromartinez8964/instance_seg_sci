@@ -41,6 +41,13 @@ def apply_importance_to_dt(dts: torch.Tensor,
     return effective_dt * dt_factor
 
 
+def apply_importance_to_output(y: torch.Tensor,
+                               importance: torch.Tensor,
+                               output_scale: torch.Tensor) -> torch.Tensor:
+    safe_output_scale = output_scale.to(dtype=y.dtype)
+    return y * (1.0 + safe_output_scale * importance.to(dtype=y.dtype))
+
+
 class IGSS2D(SS2D):
     """SS2D with region-priority 1D cross scan."""
 
@@ -55,6 +62,7 @@ class IGSS2D(SS2D):
                  ig_mode: str = 'scan',
                  gate_scale: float = 0.1,
                  dt_scale: float = 0.03,
+                 output_scale: float = 0.05,
                  gate_mode: str = 'positive',
                  descending_only: bool = False,
                  **kwargs):
@@ -79,6 +87,9 @@ class IGSS2D(SS2D):
         self.dt_scale_raw = torch.nn.Parameter(
             torch.tensor(_inverse_softplus(max(dt_scale, 1e-6)),
                          dtype=torch.float32))
+        self.output_scale_raw = torch.nn.Parameter(
+            torch.tensor(_inverse_softplus(max(output_scale, 1e-6)),
+                         dtype=torch.float32))
         self._official_forward_core = original_forward_core
 
         if self.ig_mode not in {'scan', 'z_gate', 'dt_gate'}:
@@ -100,6 +111,10 @@ class IGSS2D(SS2D):
     @property
     def dt_scale(self) -> torch.Tensor:
         return F.softplus(self.dt_scale_raw)
+
+    @property
+    def output_scale(self) -> torch.Tensor:
+        return F.softplus(self.output_scale_raw)
 
     def set_fg_target(self, fg_target: torch.Tensor | None) -> None:
         self.ig_scan_module.set_fg_target(fg_target)
@@ -241,6 +256,15 @@ class IGSS2D(SS2D):
 
         y = self.forward_core(x)
         y = self.out_act(y)
+        if self.ig_mode == 'dt_gate':
+            output_importance = self.ig_scan_module.last_importance
+            if output_importance is not None:
+                output_importance = output_importance if self.channel_first else output_importance.permute(
+                    0, 2, 3, 1).contiguous()
+                y = apply_importance_to_output(
+                    y,
+                    output_importance,
+                    self.output_scale)
         if not self.disable_z:
             if self.ig_mode == 'z_gate' and importance is not None:
                 z_importance = importance if self.channel_first else importance.permute(
