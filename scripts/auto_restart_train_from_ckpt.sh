@@ -20,6 +20,10 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 
+# If no new log output for this long, treat as hang and restart.
+STALL_TIMEOUT_SECONDS="${STALL_TIMEOUT_SECONDS:-1800}"
+STALL_CHECK_INTERVAL_SECONDS="${STALL_CHECK_INTERVAL_SECONDS:-30}"
+
 pick_resume_ckpt() {
   if [ -f "$WORKDIR/last_checkpoint" ]; then
     local last_ckpt
@@ -47,6 +51,70 @@ pick_resume_ckpt() {
   echo ""
 }
 
+run_with_watchdog() {
+  local run_log="$1"
+  shift
+  local train_cmd=("$@")
+  local cmd_str
+  local child_pid
+  local child_pgid
+  local now_ts
+  local last_progress_ts
+  local log_mtime
+
+  printf -v cmd_str '%q ' "${train_cmd[@]}"
+
+  # Run train command as a separate process group so we can kill the whole
+  # pipeline (python + tee) when no log progress is observed.
+  set +e
+  setsid bash -lc "$cmd_str 2>&1 | tee -a '$RUNNER_LOG' '$run_log'" &
+  child_pid=$!
+  child_pgid=$child_pid
+  set -e
+
+  if [ -f "$run_log" ]; then
+    last_progress_ts=$(stat -c %Y "$run_log" 2>/dev/null || date +%s)
+  else
+    last_progress_ts=$(date +%s)
+  fi
+
+  while kill -0 "$child_pid" 2>/dev/null; do
+    now_ts=$(date +%s)
+    log_mtime=$(stat -c %Y "$run_log" 2>/dev/null || echo "$last_progress_ts")
+    if [ "$log_mtime" -gt "$last_progress_ts" ]; then
+      last_progress_ts="$log_mtime"
+    fi
+
+    if [ $((now_ts - last_progress_ts)) -ge "$STALL_TIMEOUT_SECONDS" ]; then
+      echo "[$(date '+%F %T')] stall detected: no log update for ${STALL_TIMEOUT_SECONDS}s; terminating process group $child_pgid" \
+        | tee -a "$RUNNER_LOG" "$run_log"
+      kill -TERM -- "-$child_pgid" 2>/dev/null || true
+
+      for _ in 1 2 3 4 5 6; do
+        if ! kill -0 "$child_pid" 2>/dev/null; then
+          break
+        fi
+        sleep 5
+      done
+
+      if kill -0 "$child_pid" 2>/dev/null; then
+        echo "[$(date '+%F %T')] process group $child_pgid still alive; force killing" \
+          | tee -a "$RUNNER_LOG" "$run_log"
+        kill -KILL -- "-$child_pgid" 2>/dev/null || true
+      fi
+
+      wait "$child_pid" 2>/dev/null || true
+      set +e
+      return 124
+    fi
+
+    sleep "$STALL_CHECK_INTERVAL_SECONDS"
+  done
+
+  wait "$child_pid"
+  return $?
+}
+
 attempt=0
 while true; do
   attempt=$((attempt + 1))
@@ -56,17 +124,15 @@ while true; do
 
   echo "[$(date '+%F %T')] attempt=$attempt session=${SESSION_NAME:-<none>} resume=${resume_ckpt:-<none>}" | tee -a "$RUNNER_LOG" "$run_log"
 
+  train_cmd=(python tools/train.py "$CONFIG" --work-dir "$WORKDIR")
   if [ -n "$resume_ckpt" ]; then
-    set +e
-    python tools/train.py "$CONFIG" --work-dir "$WORKDIR" --resume "$resume_ckpt" 2>&1 | tee -a "$RUNNER_LOG" "$run_log"
-    exit_code=${PIPESTATUS[0]}
-    set -e
-  else
-    set +e
-    python tools/train.py "$CONFIG" --work-dir "$WORKDIR" 2>&1 | tee -a "$RUNNER_LOG" "$run_log"
-    exit_code=${PIPESTATUS[0]}
-    set -e
+    train_cmd+=(--resume "$resume_ckpt")
   fi
+
+  set +e
+  run_with_watchdog "$run_log" "${train_cmd[@]}"
+  exit_code=$?
+  set -e
 
   echo "[$(date '+%F %T')] exit_code=$exit_code" | tee -a "$RUNNER_LOG" "$run_log"
   if [ "$exit_code" -eq 0 ]; then

@@ -6,6 +6,8 @@ from mmdet.registry import MODELS
 
 from mmdet.models.backbones.vmamba_official.vmamba import Backbone_VSSM, SS2D
 
+from .fg_ig_scan import ForegroundHead
+from .global_attention import RSGlobalAttentionBlock
 from .ig_ss2d import IGSS2D
 
 
@@ -28,6 +30,7 @@ class RSLightMambaBackbone(Backbone_VSSM):
         strict_pretrained=False,
         ig_scan_stages: Optional[List[int]] = None,
         ig_region_size: int = 4,
+        ig_region_score_mode: str = 'avg',
         ig_guidance_scale: float = 0.1,
         ig_lk_size: int = 7,
         ig_descending_only: bool = False,
@@ -40,6 +43,18 @@ class RSLightMambaBackbone(Backbone_VSSM):
         ig_fg_gn_groups: int = 8,
         ig_use_fg_loss: bool = False,
         ig_fg_loss_weight: float = 0.0,
+        attention_stages: Optional[List[int]] = None,
+        attention_num_heads: int = 8,
+        attention_mlp_ratio: float = 4.0,
+        attention_qkv_bias: bool = True,
+        attention_attn_drop: float = 0.0,
+        attention_proj_drop: float = 0.0,
+        attention_fg_stage: Optional[int] = None,
+        attention_use_fg_loss: bool = False,
+        attention_fg_loss_weight: float = 0.0,
+        attention_fg_lk_size: int = 7,
+        attention_fg_norm_type: str = 'bn',
+        attention_fg_gn_groups: int = 8,
         **kwargs,
     ):
         self._ig_scan_stages = sorted(set(ig_scan_stages or []))
@@ -47,20 +62,52 @@ class RSLightMambaBackbone(Backbone_VSSM):
         self._ig_guidance_scale = ig_guidance_scale
         self._ig_lk_size = ig_lk_size
         self._ig_descending_only = ig_descending_only
-        self._ig_mode = ig_mode
-        self._ig_gate_scale = ig_gate_scale
-        self._ig_dt_scale = ig_dt_scale
-        self._ig_output_scale = ig_output_scale
-        self._ig_gate_mode = ig_gate_mode
         self._ig_fg_norm_type = ig_fg_norm_type
         self._ig_fg_gn_groups = ig_fg_gn_groups
         self._ig_use_fg_loss = ig_use_fg_loss
         self._ig_fg_loss_weight = ig_fg_loss_weight
+        self._attention_stages = sorted(set(attention_stages or []))
+        self._attention_num_heads = attention_num_heads
+        self._attention_mlp_ratio = attention_mlp_ratio
+        self._attention_qkv_bias = attention_qkv_bias
+        self._attention_attn_drop = attention_attn_drop
+        self._attention_proj_drop = attention_proj_drop
+        self._attention_fg_stage = attention_fg_stage
+        self._attention_use_fg_loss = attention_use_fg_loss
+        self._attention_fg_loss_weight = attention_fg_loss_weight
+        self._attention_fg_lk_size = attention_fg_lk_size
+        self._attention_fg_norm_type = attention_fg_norm_type
+        self._attention_fg_gn_groups = attention_fg_gn_groups
         self._ss2d_defaults = dict(
             ssm_init=kwargs.get('ssm_init', 'v0'),
             forward_type=kwargs.get('forward_type', 'v2'),
         )
         self._ig_modules: List[IGSS2D] = []
+        self._current_fg_target: torch.Tensor | None = None
+        self._last_attention_importance: torch.Tensor | None = None
+        self._last_attention_fg_loss: torch.Tensor | None = None
+        self._attention_importance_head: ForegroundHead | None = None
+
+        if ig_mode != 'scan':
+            raise ValueError(
+                'Only ig_mode="scan" is kept after cleanup. '
+                'Use the v3b reorder path or the new Stage 4 attention path.')
+        if ig_region_score_mode != 'avg':
+            raise ValueError(
+                'Only avg region scoring is kept after cleanup to preserve '
+                'the v3b rollback line.')
+        if any(stage in self._attention_stages for stage in self._ig_scan_stages):
+            overlap = sorted(set(self._attention_stages) & set(self._ig_scan_stages))
+            raise ValueError(f'attention_stages and ig_scan_stages cannot overlap: {overlap}')
+        if self._attention_use_fg_loss and self._attention_fg_stage is None:
+            if not self._attention_stages:
+                raise ValueError('attention_use_fg_loss=True requires attention_stages.')
+            self._attention_fg_stage = self._attention_stages[-1]
+        if self._attention_fg_stage is not None:
+            if self._attention_fg_stage not in out_indices:
+                raise ValueError('attention_fg_stage must be included in out_indices.')
+            if self._attention_fg_stage not in self._attention_stages:
+                raise ValueError('attention_fg_stage must be one of attention_stages.')
 
         # Disable parent preload and use explicit research loader for clarity.
         super().__init__(
@@ -70,8 +117,16 @@ class RSLightMambaBackbone(Backbone_VSSM):
             **kwargs,
         )
 
+        if self._attention_stages:
+            self._upgrade_to_attention_stages()
         if self._ig_scan_stages:
             self._upgrade_to_ig_scan()
+        if self._attention_fg_stage is not None:
+            self._attention_importance_head = ForegroundHead(
+                d_inner=self.dims[self._attention_fg_stage],
+                lk_size=self._attention_fg_lk_size,
+                norm_type=self._attention_fg_norm_type,
+                gn_groups=self._attention_fg_gn_groups)
 
         self.pretrained_key = pretrained_key
         self.strict_pretrained = strict_pretrained
@@ -114,11 +169,6 @@ class RSLightMambaBackbone(Backbone_VSSM):
             fg_loss_weight=(self._ig_fg_loss_weight if self._ig_use_fg_loss else 0.0),
             fg_norm_type=self._ig_fg_norm_type,
             fg_gn_groups=self._ig_fg_gn_groups,
-            ig_mode=self._ig_mode,
-            gate_scale=self._ig_gate_scale,
-            dt_scale=self._ig_dt_scale,
-            output_scale=self._ig_output_scale,
-            gate_mode=self._ig_gate_mode,
             descending_only=self._ig_descending_only,
             block_idx=block_idx,
         )
@@ -132,6 +182,39 @@ class RSLightMambaBackbone(Backbone_VSSM):
         }
         new_op.load_state_dict(compatible, strict=False)
         return new_op
+
+    def _build_attention_block(self, stage_idx: int,
+                               old_block: nn.Module) -> RSGlobalAttentionBlock:
+        drop_path = float(getattr(getattr(old_block, 'drop_path', None),
+                                  'drop_prob', 0.0) or 0.0)
+        return RSGlobalAttentionBlock(
+            hidden_dim=self.dims[stage_idx],
+            num_heads=self._attention_num_heads,
+            mlp_ratio=self._attention_mlp_ratio,
+            drop_path=drop_path,
+            qkv_bias=self._attention_qkv_bias,
+            attn_drop=self._attention_attn_drop,
+            proj_drop=self._attention_proj_drop,
+            use_checkpoint=getattr(old_block, 'use_checkpoint', False),
+            channel_first=self.channel_first)
+
+    def _upgrade_to_attention_stages(self):
+        replaced = 0
+        for stage_idx in self._attention_stages:
+            if stage_idx >= len(self.layers):
+                print(f'[Stage4-Attn] Warning: stage {stage_idx} does not exist.')
+                continue
+
+            blocks = self.layers[stage_idx].blocks
+            new_blocks = []
+            for block in blocks:
+                new_blocks.append(self._build_attention_block(stage_idx, block))
+                replaced += 1
+            self.layers[stage_idx].blocks = nn.Sequential(*new_blocks)
+
+        print(
+            f'[Stage4-Attn] Replaced {replaced} VSS blocks in stages '
+            f'{self._attention_stages} with global attention.')
 
     def _upgrade_to_ig_scan(self):
         upgraded = 0
@@ -151,7 +234,7 @@ class RSLightMambaBackbone(Backbone_VSSM):
 
         print(
             f'[IG-Scan] Upgraded {upgraded} VSS blocks in stages '
-            f'{self._ig_scan_stages} with mode={self._ig_mode}, '
+            f'{self._ig_scan_stages} with mode=scan, '
             f'region_size={self._ig_region_size}.')
 
     @staticmethod
@@ -283,35 +366,99 @@ class RSLightMambaBackbone(Backbone_VSSM):
         return torch.stack(batch_fg, dim=0)
 
     def set_ig_targets(self, batch_data_samples, input_shape, device=None) -> None:
-        if not self._ig_modules:
+        if not self._ig_modules and not self._attention_use_fg_loss:
             return
 
         device = device or next(self.parameters()).device
         fg_target = None
-        if self._ig_use_fg_loss:
+        if self._ig_use_fg_loss or self._attention_use_fg_loss:
             fg_target = self._build_fg_target(batch_data_samples, input_shape, device)
+        self._current_fg_target = fg_target
+        self._last_attention_importance = None
+        self._last_attention_fg_loss = None
 
         for module in self._ig_modules:
             module.reset_runtime_state()
             module.set_fg_target(fg_target)
 
     def clear_ig_targets(self) -> None:
+        self._current_fg_target = None
+        self._last_attention_importance = None
+        self._last_attention_fg_loss = None
         for module in self._ig_modules:
             module.clear_fg_target()
             module.reset_runtime_state()
 
-    def get_ig_aux_losses(self) -> dict:
-        if not self._ig_modules or not self._ig_use_fg_loss:
-            return {}
-
-        loss_values = []
+    def set_ig_fg_loss_weight(self, fg_loss_weight: float) -> None:
+        safe_weight = float(max(fg_loss_weight, 0.0))
+        self._ig_fg_loss_weight = safe_weight
+        if self._attention_use_fg_loss:
+            self._attention_fg_loss_weight = safe_weight
         for module in self._ig_modules:
-            fg_loss = module.get_fg_loss()
-            if fg_loss is not None:
-                loss_values.append(fg_loss)
+            module.set_fg_loss_weight(safe_weight)
+
+    def _compute_attention_fg_loss(self,
+                                   importance: torch.Tensor) -> torch.Tensor | None:
+        if self._current_fg_target is None or not self._attention_use_fg_loss:
+            return None
+
+        fg_target = self._current_fg_target.to(
+            device=importance.device, dtype=importance.dtype)
+        if fg_target.shape[-2:] != importance.shape[-2:]:
+            fg_target = torch.nn.functional.interpolate(
+                fg_target,
+                size=importance.shape[-2:],
+                mode='area')
+            fg_target = fg_target.clamp(0.0, 1.0)
+
+        with torch.amp.autocast(device_type=importance.device.type, enabled=False):
+            loss = torch.nn.functional.binary_cross_entropy(
+                importance.float(),
+                fg_target.float())
+        return loss * self._attention_fg_loss_weight
+
+    def get_ig_aux_losses(self) -> dict:
+        loss_values = []
+        if self._ig_use_fg_loss:
+            for module in self._ig_modules:
+                fg_loss = module.get_fg_loss()
+                if fg_loss is not None:
+                    loss_values.append(fg_loss)
+
+        if self._last_attention_fg_loss is not None:
+            loss_values.append(self._last_attention_fg_loss)
 
         self.clear_ig_targets()
         if not loss_values:
             return {}
 
         return {'loss_fg': torch.stack(loss_values).mean()}
+
+    def forward(self, x):
+        def layer_forward(layer, hidden):
+            hidden = layer.blocks(hidden)
+            downsampled = layer.downsample(hidden)
+            return hidden, downsampled
+
+        x = self.patch_embed(x)
+        outs = []
+        for stage_idx, layer in enumerate(self.layers):
+            stage_out, x = layer_forward(layer, x)
+            if stage_idx in self.out_indices:
+                norm_layer = getattr(self, f'outnorm{stage_idx}')
+                out = norm_layer(stage_out)
+                if not self.channel_first:
+                    out = out.permute(0, 3, 1, 2)
+                out = out.contiguous()
+
+                if (self._attention_importance_head is not None
+                        and stage_idx == self._attention_fg_stage):
+                    self._last_attention_importance = self._attention_importance_head(out)
+                    self._last_attention_fg_loss = self._compute_attention_fg_loss(
+                        self._last_attention_importance)
+
+                outs.append(out)
+
+        if len(self.out_indices) == 0:
+            return x
+        return outs

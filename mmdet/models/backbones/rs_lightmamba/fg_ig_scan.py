@@ -142,6 +142,9 @@ class FGIGScan(nn.Module):
         self.last_grid_shape: Optional[Tuple[int, int]] = None
         self.last_fg_loss: Optional[torch.Tensor] = None
 
+    def set_fg_loss_weight(self, fg_loss_weight: float) -> None:
+        self.fg_loss_weight = float(max(fg_loss_weight, 0.0))
+
     @property
     def guidance_scale(self) -> torch.Tensor:
         return torch.sigmoid(self._guidance_scale_raw)
@@ -179,7 +182,7 @@ class FGIGScan(nn.Module):
                 fg_target,
                 size=importance.shape[-2:],
                 mode='area')
-            fg_target = (fg_target > 0).to(dtype=importance.dtype)
+            fg_target = fg_target.clamp(0.0, 1.0)
 
         # BCE on probabilities is not autocast-safe. Compute it in FP32 and
         # return the scaled scalar to the mixed-precision training loop.

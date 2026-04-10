@@ -214,6 +214,9 @@ v3 训练后的关键判断已经发生变化：
 | v2 | 区域优先级 1D 重排 | 真正控制 scan sequence | 无显式监督，小目标被区域均值淹没 | 方法成立，但监督不足 |
 | v3 | 在 v2 上增加显式前景辅助 loss | 给 importance 明确前景学习目标 | importance 学准了，但指标几乎未涨 | 监督问题被基本排除 |
 | v4 | 恢复官方 scan 路径，importance 调制 z 门控 | 不打断 SSM 连续建模，引入前景感知选择性门控 | 待验证 | 当前下一主线 |
+| v5a / v5b | importance 注入 dt，修复死区并改进下采样 | 证明 dt 主线优于 z-gate | 仍未稳定超过 baseline | 主线成立，但上限仍未被抬高 |
+| v6 | dt + 输出双路调制 | 完成最后一次注入位置验证 | 最终低于 baseline，且不如预期 | 双路调制不作为最终冻结版 |
+| v3b | 回到 v3 主线，采用 area 下采样 + soft target | 首次在峰值 checkpoint 上超过 official baseline | 最终 epoch 未稳定站上 baseline | 成为当前 FG-IG-Scan 的阶段性成立版本 |
 
 ---
 
@@ -990,9 +993,190 @@ v6 的实验预期应保持克制。
 2. v6 新增输出调制并没有立刻造成训练发散。
 3. 是否能转化为 segm mAP 提升，还需要等待每个 val 节点的正式结果。
 
+### 10.10 v6 的最终结果与路线判定
+
+v6 的 2292 主干 1x 训练已经完成，最终结果为：
+
+1. segm mAP = 0.401
+2. segm AP50 = 0.628
+3. segm AP75 = 0.433
+4. segm APs = 0.259
+5. segm APm = 0.475
+6. segm APl = 0.578
+
+对应 official VMamba 2292 baseline 为：
+
+1. segm mAP = 0.406
+2. segm AP50 = 0.637
+3. segm AP75 = 0.436
+4. segm APs = 0.260
+5. segm APm = 0.482
+6. segm APl = 0.595
+
+这意味着：
+
+1. v6 不仅没有超过 official baseline。
+2. 它与 baseline 仍有 0.005 的 segm mAP 差距。
+3. 这种差距已经不能再简单解释为“只差一点 schedule”或“只差一点调参”。
+
+因此，v6 的最终结论应写得明确：
+
+1. dt + 输出双路调制并未成为 FG-IG-Scan 的最终冻结结构。
+2. 输出端再次调制并没有带来预期中的稳定增益。
+3. 在当前时间预算下，继续围绕 dual modulation 细修的性价比已经偏低。
+
+也正因此，研究路线在 v6 结束后发生了一次重要回摆：
+
+1. 不再继续沿 v6 深挖。
+2. 回到此前已经接近成功的 reorder 分支。
+3. 在更强的 2292 主干上重新验证 v3 路线是否能以更保守的方式站上 baseline。
+
 ---
 
-## 11. 后续记录规范
+## 11. v3b：回到 v3 主线，采用 area 下采样 + soft target 监督
+
+### 11.1 为什么从 v6 回到 v3
+
+v6 结束之后，重新回看已有实验时，出现了一个非常关键的事实：
+
+1. v6 的最终 segm mAP 只有 0.401，低于 official VMamba 2292 baseline 的 0.406。
+2. 与之相比，早先的 v3 reorder 路线虽然在 2241 上没有形成最终结论，但它对 APs 和前景区域可视化的表现更有潜力。
+3. 更重要的是，后续复查配置继承关系后确认：通用 v3 配置本身就是 2292 主干，2241 只是一个特化别名配置。
+
+这意味着：
+
+1. 不需要再额外新开一条“v3 on 2292”的结构分支。
+2. 真正值得验证的是：在 v3 的 Stage 4 only reorder 框架上，把 foreground target 做得更平滑，是否就足以把它推过 baseline。
+
+因此，v3b 的定位非常明确：
+
+1. 不再引入新调制结构。
+2. 不再切换注入位置。
+3. 只在 v3 上做一次最小但关键的 supervision refinement。
+
+### 11.2 v3b 的核心改动
+
+v3b 相比 v3 只做了一项核心改动：
+
+1. fg_target 下采样从原来的“area 后再硬二值化”改为保留 area 下采样后的连续值。
+2. 即把原先更接近 binary target 的 supervision，改为真正的 soft target 监督。
+
+对应实现逻辑是：
+
+1. 先把 union foreground mask 下采样到当前 importance 分辨率。
+2. 下采样方式采用 area。
+3. 下采样后不再做 `> 0` 的硬二值化，而是保留 `[0, 1]` 连续覆盖比例。
+
+这一步背后的判断是：
+
+1. 对于遥感中的小目标、细长目标和边界混合区域，硬二值化过于粗糙。
+2. area + soft target 更符合“一个低分辨率 cell 中前景占比有多高”这一真实语义。
+3. 在 reorder 分支里，这比继续增加调制复杂度更像是对症修正。
+
+### 11.3 v3b 的训练配置
+
+v3b 保持了 v3 的主体结构不变：
+
+1. 主干采用 2292，即 depths=[2, 2, 9, 2]、dims=[96, 192, 384, 768]。
+2. 仍然只在 Stage 4 only 上开启 IG-Scan。
+3. 仍采用 1D region-priority reorder。
+4. `ig_region_size=4`。
+5. `ig_descending_only=True`。
+6. 训练节奏仍为 1x / 12 epoch。
+
+换句话说，v3b 的实验目标不是再造一个新版本，而是回答：
+
+在 reorder 已经成立的前提下，只修正 target 平滑性，是否就能把方法推过 official baseline。
+
+### 11.4 v3b 的 1x 训练曲线与关键结果
+
+v3b 的 1x / 12e 训练已经完成，关键验证节点如下：
+
+1. epoch 1：segm mAP = 0.296
+2. epoch 2：segm mAP = 0.330
+3. epoch 3：segm mAP = 0.363
+4. epoch 5：segm mAP = 0.378
+5. epoch 8：segm mAP = 0.388
+6. epoch 9：segm mAP = 0.405
+7. epoch 10：segm mAP = 0.408
+8. epoch 11：segm mAP = 0.405
+9. epoch 12：segm mAP = 0.405
+
+其中最关键的结果是 epoch 10：
+
+1. segm mAP = 0.408
+2. AP50 = 0.640
+3. AP75 = 0.439
+4. APs = 0.255
+5. APm = 0.482
+6. APl = 0.579
+
+而 official VMamba 2292 baseline 为：
+
+1. segm mAP = 0.406
+2. AP50 = 0.637
+3. AP75 = 0.436
+4. APs = 0.260
+5. APm = 0.482
+6. APl = 0.595
+
+因此，v3b 的最重要结论是：
+
+1. 它首次在 best checkpoint 上超过了 official VMamba 2292 baseline。
+2. 超过幅度为 +0.002 segm mAP。
+3. 这说明 FG-IG-Scan 第一创新点并没有被证伪，且 reorder 分支并非无效探索。
+
+### 11.5 如何理解 v3b 的结果
+
+v3b 的结果不能被简单写成“最终已经全面超过 baseline”，更准确的表述应是：
+
+1. v3b 在 best checkpoint 上已经证明这条路线可以超过 baseline。
+2. 但其最后一个 epoch 仍回落到 0.405，没有稳定保持在 0.406 以上。
+3. 因此当前更适合把 v3b 视作“阶段性成立版本”，而不是已经完全收口的最终冻结版。
+
+从研究判断上，这个结果非常关键，因为它说明：
+
+1. v6 那种更复杂的双路调制未必比更保守的 reorder + better target 更有效。
+2. 当前 FG-IG-Scan 最值得巩固的成果，不是继续增加结构复杂度，而是把 v3b 的增益做稳定。
+3. 后续判断应围绕“能否稳定复现并保持超过 baseline”展开，而不是再贸然切回新的结构分支。
+
+### 11.6 当前阶段：启动 v3b 的 2x 训练以巩固成果
+
+基于上述判断，当前路线已经进一步收敛为：
+
+1. 暂不继续围绕新重排策略或新调制结构发散。
+2. 先巩固 v3b 已经取得的 best-checkpoint 优势。
+3. 用一次更公平的 2x / 24e 训练，确认这条线能否把“峰值超过 baseline”转化为“更稳定的最终结果”。
+
+当前已建立并启动的配置为：
+
+1. `mask_rcnn_rs_lightmamba_ig_scan_v3b_fpn_2x_isaid.py`
+2. work_dir 为 `work_dirs/mask_rcnn_rs_lightmamba_ig_scan_v3b_fpn_2x_isaid`
+
+这次 2x 训练的策略不是简单照搬 1x，而是采用更稳妥的巩固方案：
+
+1. 总训练时长改为 24 epoch。
+2. 每个 epoch 做一次验证，便于捕捉 best checkpoint。
+3. checkpoint 按 `coco/segm_mAP` 保存 best。
+4. foreground auxiliary loss 采用前强后弱的线性衰减策略：
+5. epoch 1 到 8 保持 `fg_loss_weight=0.2`。
+6. epoch 8 到 24 线性衰减到 `0.05`。
+
+这样设计的原因是：
+
+1. 前期 importance head 仍需要足够强的监督信号快速学到前景区域分布。
+2. 后期若继续维持 0.2，foreground auxiliary loss 可能会和 detection / segmentation 主任务产生过强梯度竞争。
+3. 因此 2x 的目标不是再改变方法，而是减少后期干扰、巩固目前已经出现的正向结果。
+
+截至当前，v3b 2x 已进入正式训练流程，auto-restart 记录显示：
+
+1. 已成功启动第 1 次训练尝试。
+2. tmux 会话名为 `v3b_2x_decay_autorestart`。
+3. 当前任务的研究定位非常明确：不是继续造新版本，而是先把 v3b 这条已经越过 baseline 的路线做稳。
+
+---
+
+## 12. 后续记录规范
 
 从本文件开始，后续每一版都应追加以下内容：
 
@@ -1013,4 +1197,164 @@ v6 的实验预期应保持克制。
 
 1. 为什么要从上一版升级？
 2. 这一版到底解决了什么、又暴露了什么？
+
+v3b -> v3c 加了区域分数max与avg混合 + fg损失函数bce+traversky ->v3d: 只保留bce+traversky 结果都不好
+---
+
+## 13. 2026.4 主线重定义：从 FG-IG-Scan 演进到 Freq-Global Hybrid Encoder
+
+### 13.1 为什么要在 v3b 之后重定义第一创新点
+
+截至当前，已有实验已经把一件事说明得比较清楚：
+
+1. 纯 reorder 路线并没有被证伪，因为 v3b 的 best checkpoint 已经达到 segm mAP 0.408，超过 official VMamba 2292 baseline 0.002。
+2. 但 reorder 的最终 epoch 结果没有稳定站上 baseline，因此它更适合作为“阶段性成立分支”，而不是继续无限细修的最终主线。
+3. v4 到 v6 的 z / dt / dual modulation 路线虽然在论文叙事上完整，但在当前这套 LightMamba 结构下并没有稳定抬高上限。
+4. 因此，第一创新点不能再继续定义为“importance 如何调制 SSM 内部参数”，而应升级为“如何重构更适合遥感实例分割的主干混合编码器”。
+
+基于这一判断，从本节开始，第一创新点的论文级正式定义改为：
+
+**Freq-Global Hybrid Encoder：前两级采用外部并联的频域增强 SSM，最后一级采用全局 attention，并在最终语义 stage 输出高质量 Importance Map。**
+
+这里有两个原则需要明确写死：
+
+1. 不再把 dt / z 内部门控调制作为当前主线继续扩展。
+2. v3b reorder 保留为历史最优回退线，但不再作为下一阶段的主要研发方向。
+
+### 13.2 第一创新点的论文级方法定义
+
+新的第一创新点建议在论文中定义为：
+
+**频域-全局感知混合编码器（Freq-Global Hybrid Encoder, FGHE）**。
+
+其核心思想是：
+
+1. 遥感图像浅层特征中，小车、小船、桥梁边缘等高频结构极其重要，而标准 SSM 在浅层更容易呈现低通倾向，因此需要一个轻量频域增强分支补偿高频边界信息。
+2. 遥感图像深层特征中，真正决定实例分割上限的往往不是局部边缘，而是目标与场景之间的全局语义关系；因此在最后一个语义 stage 上，使用全局 attention 比继续坚持 SSM 更合理。
+3. 最终语义 stage 不只负责输出 backbone 特征，还负责预测一张高质量 Importance Map，为后续 IG-FPN 提供统一的前景先验来源。
+
+对应到结构上，可正式写成：
+
+1. Stage 1：标准 VSS block + 并联频域增强分支。
+2. Stage 2：标准 VSS block + 并联频域增强分支。
+3. Stage 3：先保持标准 VSS，不在第一轮实现中立即引入频域分支。
+4. Stage 4：用 Global Attention Block 整体替换原 VSS block，并在其输出后接前景监督 Importance Head。
+
+这里刻意不把频域分支一口气扩到 Stage 1、2、3，原因是：
+
+1. 第一轮最需要验证的是 Stage 4 的 mixer 是否是当前瓶颈。
+2. 如果一开始就同时改 S1、S2、S3，消融会迅速失去可解释性。
+3. S1、S2 本身最接近边缘纹理层，更符合频域增强的动机；S3 是否有必要进入频域分支，应作为后续增量问题而不是初始假设。
+
+### 13.3 当前冻结的三创新点叙事
+
+从本节开始，论文主线建议固定为以下三点：
+
+#### 创新点 1：Freq-Global Hybrid Encoder
+
+1. Stage 1-2：外部并联频域增强的 SSM。
+2. Stage 4：全局 attention 语义 stage。
+3. Stage 4 输出后接 Importance Head，产生语义主导的前景重要性图。
+
+#### 创新点 2：IG-FPN
+
+1. 使用来自最终语义 stage 的 Importance Map。
+2. 将其上采样后注入 FPN 的自顶向下融合路径。
+3. 目标是减少小目标在 neck 和 RPN 阶段被稀释或漏检的概率。
+
+#### 创新点 3：Integral Distillation
+
+1. Backbone 浅层蒸馏约束边缘与纹理。
+2. 深层蒸馏约束语义表达。
+3. FPN 层蒸馏约束多尺度融合一致性。
+
+这样定义之后，整篇论文的故事线会比“reorder -> z -> dt -> dual modulation”更加稳定，也更符合当前实验事实。
+
+### 13.4 当前代码实现的第一步：只先做 Stage 4 Attention 替换
+
+当前最优先动作不是立即加入频域分支，而是先完成一个最小且高价值的结构替换实验：
+
+1. 保持 Stage 1-3 不变。
+2. 只把 Stage 4 原有 VSS blocks 替换为 Global Attention Blocks。
+3. 在 Stage 4 输出后挂上 Importance Head，并保留 BCE 前景辅助监督。
+
+这一步要回答的问题非常聚焦：
+
+1. 在不引入 IG-FPN、频域分支、蒸馏的前提下，仅仅替换最终语义 stage 的 token mixer，是否能改善大目标拓扑和全局场景关系建模。
+2. 新的 Stage 4 attention 输出能否学出更稳定、更干净的 Importance Map。
+3. 这条线是否值得作为后续 IG-FPN 的前景先验来源继续推进。
+
+因此，当前这个版本的研究定位应写成：
+
+**Backbone transition probe：验证“Stage 4 from SSM to global attention”是否成立。**
+
+### 13.5 论文主消融表框架
+
+建议从这一版开始，把主消融顺序固定成下面这个框架。
+
+#### 表 A：第一创新点 Backbone 主消融
+
+| Row | 配置名 | 核心变化 | 目的 |
+|---|---|---|---|
+| A0 | RS-LightMamba baseline | 原始 4-stage VSSM | 作为统一对照基线 |
+| A1 | + S4 Global Attention | 仅把 Stage 4 换成 global attention | 验证最终语义 stage mixer 是否是当前主瓶颈 |
+| A2 | + S4 Global Attention + FG supervision | 在 A1 上增加 Stage 4 Importance Head + BCE | 验证 attention stage 是否能学出更高质量前景先验 |
+| A3 | + S1 Freq branch + S4 Global Attention | 在 A2 基础上只给 Stage 1 加频域分支 | 验证最浅层频域增强是否立即有效 |
+| A4 | + S1-S2 Freq branch + S4 Global Attention | 在 A2 基础上给 Stage 1 和 2 都加频域分支 | 作为第一创新点的完整初版 |
+| A5 | + S1-S2-S3 Freq branch + S4 Global Attention | 仅作为后续可选扩展，不作为当前首轮默认 | 判断 Stage 3 是否真的还需要频域增强 |
+
+这里必须强调：
+
+1. 当前默认消融顺序是 A0 -> A1 -> A2 -> A3 -> A4。
+2. A5 不是当前必须项，只能在 A4 已成立的前提下再考虑。
+
+#### 表 B：第二创新点 IG-FPN 消融
+
+| Row | 配置名 | 变化 | 目的 |
+|---|---|---|---|
+| B0 | A2 或 A4 backbone only | 不加 neck importance 注入 | 作为 IG-FPN 对照 |
+| B1 | + IG-FPN (single injection) | 只在 top-down 一处注入 importance | 验证单点注入是否足够 |
+| B2 | + IG-FPN (multi-level injection) | 在多个 FPN 融合节点注入 importance | 验证多层级注入收益 |
+
+#### 表 C：第三创新点蒸馏消融
+
+| Row | 配置名 | 变化 | 目的 |
+|---|---|---|---|
+| C0 | backbone + neck 完整结构 | 不加蒸馏 | 作为教师约束前基线 |
+| C1 | + shallow distillation | 只蒸馏浅层边缘 | 验证浅层约束 |
+| C2 | + deep distillation | 只蒸馏深层语义 | 验证语义约束 |
+| C3 | + pyramid distillation | 只蒸馏 FPN | 验证 neck 约束 |
+| C4 | + integral distillation | 三者联合 | 作为最终完整模型 |
+
+### 13.6 与 v3b rollback 的关系如何写
+
+新的主线不等于要抹掉 v3b。
+
+文档中应明确写成：
+
+1. v3b 是 FG-IG-Scan reorder 分支的最强历史版本，其 best checkpoint 已达到 0.408。
+2. 它保留为当前代码中的“稳定回退线”，用于证明前景引导扫描并非无效探索。
+3. 但从 2026.4 开始，论文第一创新点的主线不再继续围绕 reorder 或 dt/z 调制展开，而转为 Freq-Global Hybrid Encoder。
+
+这样写的好处是：
+
+1. 历史实验不会浪费。
+2. 失败分支不会继续污染主线叙事。
+3. 审稿时也可以自然解释方法是如何从 reorder 探索过渡到更强的 hybrid backbone 设计的。
+
+### 13.7 从现在开始的实现优先级
+
+当前代码与实验顺序必须收敛为：
+
+1. 先完成并验证 Stage 4 Global Attention 替换版。
+2. 再把 Stage 4 输出的 Importance Map 接入 IG-FPN。
+3. 最后再把频域分支从 Stage 1 扩展到 Stage 2。
+
+也就是说，当前不应该：
+
+1. 重新捡回 dt / z 门控细修。
+2. 一上来把频域分支铺到 S1、S2、S3。
+3. 在 Attention、IG-FPN、Freq branch 还没解耦时就同步引入蒸馏。
+
+从论文推进角度看，这个顺序最稳，也最容易形成一张干净、能自圆其说的主消融表。
 
