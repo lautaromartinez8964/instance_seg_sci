@@ -2,6 +2,7 @@ from typing import List, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from mmdet.registry import MODELS
 
 from mmdet.models.backbones.vmamba_official.vmamba import Backbone_VSSM, SS2D
@@ -9,6 +10,26 @@ from mmdet.models.backbones.vmamba_official.vmamba import Backbone_VSSM, SS2D
 from .fg_ig_scan import ForegroundHead
 from .global_attention import RSGlobalAttentionBlock
 from .ig_ss2d import IGSS2D
+
+
+class SpatialHighFrequencyExtractor(nn.Module):
+    """Fixed high-pass spatial extractor used to build single-channel HF maps."""
+
+    def __init__(self, eps: float = 1e-6):
+        super().__init__()
+        kernel = torch.tensor([[0.0, -1.0, 0.0],
+                               [-1.0, 4.0, -1.0],
+                               [0.0, -1.0, 0.0]], dtype=torch.float32)
+        self.register_buffer('laplacian_kernel', kernel.view(1, 1, 3, 3))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        channels = x.shape[1]
+        weight = self.laplacian_kernel.expand(channels, 1, 3, 3)
+        filtered = F.conv2d(x, weight, padding=1, groups=channels)
+        energy = filtered.abs().mean(dim=1, keepdim=True)
+        scale = energy.amax(dim=(2, 3), keepdim=True).clamp_min(self.eps)
+        return energy / scale
 
 
 @MODELS.register_module()
@@ -55,6 +76,8 @@ class RSLightMambaBackbone(Backbone_VSSM):
         attention_fg_lk_size: int = 7,
         attention_fg_norm_type: str = 'bn',
         attention_fg_gn_groups: int = 8,
+        output_hf_maps: bool = False,
+        hf_map_stages: Optional[List[int]] = None,
         **kwargs,
     ):
         self._ig_scan_stages = sorted(set(ig_scan_stages or []))
@@ -78,6 +101,9 @@ class RSLightMambaBackbone(Backbone_VSSM):
         self._attention_fg_lk_size = attention_fg_lk_size
         self._attention_fg_norm_type = attention_fg_norm_type
         self._attention_fg_gn_groups = attention_fg_gn_groups
+        self._output_hf_maps = output_hf_maps
+        self._hf_map_stages = sorted(set(hf_map_stages or ([0, 1, 2]
+                                                            if output_hf_maps else [])))
         self._ss2d_defaults = dict(
             ssm_init=kwargs.get('ssm_init', 'v0'),
             forward_type=kwargs.get('forward_type', 'v2'),
@@ -87,6 +113,7 @@ class RSLightMambaBackbone(Backbone_VSSM):
         self._last_attention_importance: torch.Tensor | None = None
         self._last_attention_fg_loss: torch.Tensor | None = None
         self._attention_importance_head: ForegroundHead | None = None
+        self._last_hf_maps: tuple[torch.Tensor, ...] = ()
 
         if ig_mode != 'scan':
             raise ValueError(
@@ -108,6 +135,12 @@ class RSLightMambaBackbone(Backbone_VSSM):
                 raise ValueError('attention_fg_stage must be included in out_indices.')
             if self._attention_fg_stage not in self._attention_stages:
                 raise ValueError('attention_fg_stage must be one of attention_stages.')
+        if self._output_hf_maps:
+            for stage_idx in self._hf_map_stages:
+                if stage_idx not in out_indices:
+                    raise ValueError(
+                        'hf_map_stages must be included in out_indices so the '
+                        'same normalized backbone features can be reused.')
 
         # Disable parent preload and use explicit research loader for clarity.
         super().__init__(
@@ -121,6 +154,7 @@ class RSLightMambaBackbone(Backbone_VSSM):
             self._upgrade_to_attention_stages()
         if self._ig_scan_stages:
             self._upgrade_to_ig_scan()
+        self._hf_map_extractor = SpatialHighFrequencyExtractor()
         if self._attention_fg_stage is not None:
             self._attention_importance_head = ForegroundHead(
                 d_inner=self.dims[self._attention_fg_stage],
@@ -385,6 +419,7 @@ class RSLightMambaBackbone(Backbone_VSSM):
         self._current_fg_target = None
         self._last_attention_importance = None
         self._last_attention_fg_loss = None
+        self._last_hf_maps = ()
         for module in self._ig_modules:
             module.clear_fg_target()
             module.reset_runtime_state()
@@ -434,6 +469,9 @@ class RSLightMambaBackbone(Backbone_VSSM):
 
         return {'loss_fg': torch.stack(loss_values).mean()}
 
+    def get_last_hf_maps(self) -> tuple[torch.Tensor, ...]:
+        return self._last_hf_maps
+
     def forward(self, x):
         def layer_forward(layer, hidden):
             hidden = layer.blocks(hidden)
@@ -442,6 +480,7 @@ class RSLightMambaBackbone(Backbone_VSSM):
 
         x = self.patch_embed(x)
         outs = []
+        hf_maps = []
         for stage_idx, layer in enumerate(self.layers):
             stage_out, x = layer_forward(layer, x)
             if stage_idx in self.out_indices:
@@ -457,8 +496,14 @@ class RSLightMambaBackbone(Backbone_VSSM):
                     self._last_attention_fg_loss = self._compute_attention_fg_loss(
                         self._last_attention_importance)
 
+                if self._output_hf_maps and stage_idx in self._hf_map_stages:
+                    hf_maps.append(self._hf_map_extractor(out))
+
                 outs.append(out)
 
         if len(self.out_indices) == 0:
             return x
-        return outs
+        if self._output_hf_maps:
+            self._last_hf_maps = tuple(hf_maps)
+            return tuple(outs), self._last_hf_maps
+        return tuple(outs)
