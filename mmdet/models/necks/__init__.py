@@ -7,6 +7,7 @@ from .dilated_encoder import DilatedEncoder
 from .dyhead import DyHead
 from .fpg import FPG
 from .fpn import FPN
+from .ig_fpn import IGFPN
 from .fpn_carafe import FPN_CARAFE
 from .fpn_dropblock import FPN_DropBlock
 from .hf_fpn import HF_FPN
@@ -24,5 +25,5 @@ __all__ = [
     'FPN', 'BFP', 'ChannelMapper', 'HRFPN', 'NASFPN', 'FPN_CARAFE', 'PAFPN',
     'NASFCOS_FPN', 'RFP', 'YOLOV3Neck', 'FPG', 'DilatedEncoder',
     'CTResNetNeck', 'SSDNeck', 'YOLOXPAFPN', 'DyHead', 'CSPNeXtPAFPN', 'SSH',
-    'FPN_DropBlock', 'HF_FPN'
+    'FPN_DropBlock', 'HF_FPN', 'IGFPN'
 ]
