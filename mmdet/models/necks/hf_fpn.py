@@ -14,10 +14,20 @@ from .fpn import FPN
 class HF_FPN(FPN):
     """FPN with high-frequency guided top-down fusion."""
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args, guided_levels=None, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         num_fusions = self.backbone_end_level - self.start_level - 1
         self.fusion_beta = torch.nn.Parameter(torch.zeros(num_fusions))
+        if guided_levels is None:
+            guided_levels = list(range(num_fusions))
+        self.guided_levels = sorted(set(guided_levels))
+        invalid_levels = [
+            level for level in self.guided_levels
+            if level < 0 or level >= num_fusions
+        ]
+        if invalid_levels:
+            raise ValueError(
+                f'guided_levels contains invalid indices: {invalid_levels}.')
         self.last_hf_maps: Tuple[Tensor, ...] = ()
         self.last_gates: Tuple[Tensor, ...] = ()
 
@@ -63,10 +73,15 @@ class HF_FPN(FPN):
                         size=laterals[i - 1].shape[2:],
                         mode='bilinear',
                         align_corners=False)
-                beta = self.fusion_beta[i - 1].to(dtype=upsampled.dtype).view(
-                    1, 1, 1, 1)
-                gate = 1.0 + beta * hf_map.to(dtype=upsampled.dtype)
-                laterals[i - 1] = laterals[i - 1] + upsampled * gate
+                hf_map = hf_map.to(dtype=upsampled.dtype)
+                if (i - 1) in self.guided_levels:
+                    beta = 0.5 * torch.tanh(self.fusion_beta[i - 1])
+                    beta = beta.to(dtype=upsampled.dtype).view(1, 1, 1, 1)
+                    gate = 1.0 + beta * hf_map
+                    laterals[i - 1] = laterals[i - 1] + upsampled * gate
+                else:
+                    gate = torch.ones_like(hf_map, dtype=upsampled.dtype)
+                    laterals[i - 1] = laterals[i - 1] + upsampled
                 gate_records.insert(0, gate.detach())
             else:
                 laterals[i - 1] = laterals[i - 1] + upsampled

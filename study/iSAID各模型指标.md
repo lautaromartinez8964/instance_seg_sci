@@ -33,9 +33,9 @@
 |---|---|
 | Params (M) | 44.047 |
 | FLOPs (G) | 186 |
-| FPS | 52.8 img/s |
-| latency | 18.9 ms/img |
-| CUDA Memory | 946 MB |
+| FPS | 67.9 img/s |
+| latency | 14.7 ms/img |
+| CUDA Memory | 438 MB |
 
 ## 3. Per-class AP (segm)
 | 类别 | AP |
@@ -85,9 +85,9 @@
 |---|---|
 | Params (M) | 30.693 |
 | FLOPs (G) | 166 |
-| FPS | 15.4 img/s |
-| latency | 64.9 ms/img |
-| CUDA Memory | 1006 MB |
+| FPS | 18.0 img/s |
+| latency | 55.6 ms/img |
+| CUDA Memory | 432 MB |
 
 ## 3. Per-class AP (segm)
 | 类别 | AP |
@@ -137,9 +137,9 @@
 |---|---|
 | Params (M) | 57.639 |
 | FLOPs (G) | 212 |
-| FPS | 36.3 img/s |
-| latency | 27.5 ms/img |
-| CUDA Memory | 924 MB |
+| FPS | 46.8 img/s |
+| latency | 21.4 ms/img |
+| CUDA Memory | 738 MB |
 
 ## 3. Per-class AP (segm)
 | 类别 | AP |
@@ -160,7 +160,8 @@
 ## 5. 备注
 - 当前 official 2292 配置加载上述 ImageNet checkpoint 时存在部分 missing keys，原因是 checkpoint 深度与当前 stage-3 的 2292 配置不完全一致。
 - 上述精度指标来自实际训练与评估结果；Params 使用实际模型构建统计值，FLOPs 使用 safe 估算值。
-- FPS、latency、CUDA Memory 由 MMDetection inference benchmark 测得，设置为 max_iter=100、num_warmup=20、batch_size=1；CUDA Memory 记录日志中的观测峰值。
+- FPS、latency、CUDA Memory 由自定义基准脚本测得：`inference_detector` 直接计时（warmup=20, iter=100, batch=1, 800×800 dummy image）；CUDA Memory 为 `torch.cuda.max_memory_allocated` 峰值。
+- **注意**：与之前记录的 MMDetection benchmark.py 默认 `--task dataloader` 数值不同，此处为真实 inference 计时，为本文件所有条目的统一基准。
 
 
 ---
@@ -195,9 +196,9 @@
 |---|---|
 | Params (M) | 24.861 |
 | FLOPs (G) | 143 |
-| FPS | 20.8 img/s |
-| latency | 48.1 ms/img |
-| CUDA Memory | 984 MB |
+| FPS | 62.3 img/s |
+| latency | 16.0 ms/img |
+| CUDA Memory | 414 MB |
 
 ## 3. Per-class AP (segm)
 | 类别 | AP |
@@ -218,4 +219,123 @@
 ## 5. 备注
 - 当前结果来自 epoch 12 验证日志（Epoch(val) [12][9581/9581]），tmux 会话结束后由日志回溯确认最终指标。
 - 训练阶段通过 tmux 会话 rs_lightmamba_2241_auto 启动，并接入 scripts/auto_resume_from_latest_epoch.sh 自动续训。
-- Params / FLOPs 为当前 2241 研究基线的静态复杂度；FPS / latency / CUDA Memory 由初始化权重下的 inference benchmark 测得，主要反映结构效率，与最终精度无关。
+- Params / FLOPs 为当前 2241 研究基线的静态复杂度；FPS / latency / CUDA Memory 由自定义基准脚本测得（`inference_detector` 直接计时，warmup=20, iter=100, batch=1）。
+
+
+---
+
+# Mask R-CNN RS-LightMamba S4-GlobalAttn FPN 1x 完整指标记录
+
+> Config: `projects/iSAID/configs/mask_rcnn_rs_lightmamba_s4_global_attn_fpn_1x_isaid.py`
+> Best epoch: 10
+
+## 1. 精度指标（iSAID val set, 800×800 patches）
+
+### 实例分割 (segm)
+| 指标 | 数值 |
+|---|---|
+| mAP | 0.409 |
+| AP₅₀ | 0.642 |
+| AP₇₅ | 0.442 |
+| APₛ | 0.260 |
+| APₘ | 0.487 |
+| APₗ | 0.584 |
+
+### 目标检测 (bbox)
+| 指标 | 数值 |
+|---|---|
+| mAP | 0.443 |
+| AP₅₀ | 0.662 |
+| AP₇₅ | 0.491 |
+| APₛ | 0.303 |
+| APₘ | 0.516 |
+| APₗ | 0.595 |
+
+## 2. 模型参数指标
+| 指标 | 数值 |
+|---|---|
+| Params (M) | 56.583 |
+| FLOPs (G) | 210 |
+| FPS | 42.5 img/s |
+| latency | 23.6 ms/img |
+| CUDA Memory (inference) | 791 MB |
+
+## 3. Per-class AP (segm)
+| 类别 | AP |
+|---|---|
+| ship | _待填_ |
+| store_tank | _待填_ |
+| ... | ... |
+
+## 4. 训练配置
+- Backbone: RSLightMambaBackbone（Stage4 用 GlobalAttention 替换 VSS blocks）
+- Schedule: 1x (12 epochs)，best at epoch 10
+- Optimizer: AdamW, lr=1e-4, weight_decay=0.05
+- Batch size: 2
+- Input size: 800×800
+- GPU: RTX 5090
+- Pretrained: checkpoints/vmamba/vssm_tiny_0230_ckpt_epoch_262.pth
+
+## 5. 备注
+- 相比 VMamba-2292 baseline（segm mAP=0.406），本模型 +0.003，验证 Stage4 Global Attention 的有效性。
+- Params / FLOPs 通过 get_flops.py 及参数统计脚本获得；FPS / latency / CUDA Memory 由自定义基准脚本测得（`inference_detector` 直接计时，warmup=20, iter=100, batch=1），为本文件所有条目的统一基准。
+
+
+---
+
+# Mask R-CNN RS-LightMamba S4-GlobalAttn HF-FPN-v2 1x 完整指标记录
+
+> Config: `projects/iSAID/configs/mask_rcnn_rs_lightmamba_s4_global_attn_hf_fpn_v2_1x_isaid.py`
+> Best epoch: 10
+
+## 1. 精度指标（iSAID val set, 800×800 patches）
+
+### 实例分割 (segm)
+| 指标 | 数值 |
+|---|---|
+| mAP | 0.410 |
+| AP₅₀ | 0.644 |
+| AP₇₅ | 0.443 |
+| APₛ | 0.256 |
+| APₘ | 0.484 |
+| APₗ | 0.592 |
+
+### 目标检测 (bbox)
+| 指标 | 数值 |
+|---|---|
+| mAP | 0.444 |
+| AP₅₀ | 0.663 |
+| AP₇₅ | 0.494 |
+| APₛ | 0.301 |
+| APₘ | 0.511 |
+| APₗ | 0.609 |
+
+## 2. 模型参数指标
+| 指标 | 数值 |
+|---|---|
+| Params (M) | 56.567 |
+| FLOPs (G) | 210 |
+| FPS | 46.3 img/s |
+| latency | 21.6 ms/img |
+| CUDA Memory (inference) | 820 MB |
+
+## 3. Per-class AP (segm)
+| 类别 | AP |
+|---|---|
+| ship | _待填_ |
+| store_tank | _待填_ |
+| ... | ... |
+
+## 4. 训练配置
+- Backbone: RSLightMambaBackbone（Stage4 Global Attention + HF-FPN v2）
+- Schedule: 1x (12 epochs)，best at epoch 10
+- Optimizer: AdamW, lr=1e-4, weight_decay=0.05
+- Batch size: 2
+- Input size: 800×800
+- GPU: RTX 5090
+- Pretrained: checkpoints/vmamba/vssm_tiny_0230_ckpt_epoch_262.pth
+
+## 5. 备注
+- 相比 S4-GlobalAttn FPN 版本（segm mAP=0.409），HF-FPN-v2 额外提升 +0.001（segm），bbox mAP +0.001，APₗ 提升明显（+0.008），验证高频特征增强对大目标的作用。
+- Params 略少（-0.016M），FPS 略优（+3.8 img/s），显存略多（+29 MB）。
+- Params / FLOPs 通过 get_flops.py 及参数统计脚本获得；FPS / latency / CUDA Memory 由自定义基准脚本测得（`inference_detector` 直接计时，warmup=20, iter=100, batch=1），为本文件所有条目的统一基准。

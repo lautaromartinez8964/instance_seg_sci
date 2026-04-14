@@ -32,6 +32,38 @@ class SpatialHighFrequencyExtractor(nn.Module):
         return energy / scale
 
 
+class CrossStageGuidanceHead(nn.Module):
+    """Fuse a lower-detail stage and a higher-semantic stage into one guidance map."""
+
+    def __init__(self,
+                 low_dim: int,
+                 high_dim: int,
+                 hidden_dim: int = 256,
+                 lk_size: int = 7,
+                 norm_type: str = 'bn',
+                 gn_groups: int = 8):
+        super().__init__()
+        self.low_proj = nn.Conv2d(low_dim, hidden_dim, kernel_size=1, bias=False)
+        self.high_proj = nn.Conv2d(high_dim, hidden_dim, kernel_size=1, bias=False)
+        self.head = ForegroundHead(
+            d_inner=hidden_dim * 2,
+            lk_size=lk_size,
+            norm_type=norm_type,
+            gn_groups=gn_groups)
+
+    def forward(self, low_feat: torch.Tensor,
+                high_feat: torch.Tensor) -> torch.Tensor:
+        high_feat = F.interpolate(
+            high_feat,
+            size=low_feat.shape[-2:],
+            mode='bilinear',
+            align_corners=False)
+        low_embed = self.low_proj(low_feat)
+        high_embed = self.high_proj(high_feat)
+        fused = torch.cat([low_embed, high_embed], dim=1)
+        return self.head(fused)
+
+
 @MODELS.register_module()
 class RSLightMambaBackbone(Backbone_VSSM):
     """Research variant backbone derived from official VMamba.
@@ -70,6 +102,7 @@ class RSLightMambaBackbone(Backbone_VSSM):
         attention_qkv_bias: bool = True,
         attention_attn_drop: float = 0.0,
         attention_proj_drop: float = 0.0,
+        attention_use_pos_embed: bool = True,
         attention_fg_stage: Optional[int] = None,
         attention_use_fg_loss: bool = False,
         attention_fg_loss_weight: float = 0.0,
@@ -78,6 +111,14 @@ class RSLightMambaBackbone(Backbone_VSSM):
         attention_fg_gn_groups: int = 8,
         output_hf_maps: bool = False,
         hf_map_stages: Optional[List[int]] = None,
+        output_guidance_map: bool = False,
+        guidance_stages: Optional[List[int]] = None,
+        guidance_hidden_dim: int = 256,
+        guidance_use_fg_loss: bool = False,
+        guidance_loss_weight: float = 0.0,
+        guidance_lk_size: int = 7,
+        guidance_norm_type: str = 'bn',
+        guidance_gn_groups: int = 8,
         **kwargs,
     ):
         self._ig_scan_stages = sorted(set(ig_scan_stages or []))
@@ -95,6 +136,7 @@ class RSLightMambaBackbone(Backbone_VSSM):
         self._attention_qkv_bias = attention_qkv_bias
         self._attention_attn_drop = attention_attn_drop
         self._attention_proj_drop = attention_proj_drop
+        self._attention_use_pos_embed = attention_use_pos_embed
         self._attention_fg_stage = attention_fg_stage
         self._attention_use_fg_loss = attention_use_fg_loss
         self._attention_fg_loss_weight = attention_fg_loss_weight
@@ -104,6 +146,15 @@ class RSLightMambaBackbone(Backbone_VSSM):
         self._output_hf_maps = output_hf_maps
         self._hf_map_stages = sorted(set(hf_map_stages or ([0, 1, 2]
                                                             if output_hf_maps else [])))
+        self._output_guidance_map = output_guidance_map
+        self._guidance_stages = list(guidance_stages or ([2, 3]
+                                                         if output_guidance_map else []))
+        self._guidance_hidden_dim = guidance_hidden_dim
+        self._guidance_use_fg_loss = guidance_use_fg_loss
+        self._guidance_loss_weight = guidance_loss_weight
+        self._guidance_lk_size = guidance_lk_size
+        self._guidance_norm_type = guidance_norm_type
+        self._guidance_gn_groups = guidance_gn_groups
         self._ss2d_defaults = dict(
             ssm_init=kwargs.get('ssm_init', 'v0'),
             forward_type=kwargs.get('forward_type', 'v2'),
@@ -114,6 +165,8 @@ class RSLightMambaBackbone(Backbone_VSSM):
         self._last_attention_fg_loss: torch.Tensor | None = None
         self._attention_importance_head: ForegroundHead | None = None
         self._last_hf_maps: tuple[torch.Tensor, ...] = ()
+        self._last_guidance_map: torch.Tensor | None = None
+        self._last_guidance_fg_loss: torch.Tensor | None = None
 
         if ig_mode != 'scan':
             raise ValueError(
@@ -141,6 +194,15 @@ class RSLightMambaBackbone(Backbone_VSSM):
                     raise ValueError(
                         'hf_map_stages must be included in out_indices so the '
                         'same normalized backbone features can be reused.')
+        if self._output_guidance_map:
+            if len(self._guidance_stages) != 2:
+                raise ValueError('guidance_stages must contain exactly two stages, e.g. [2, 3].')
+            low_stage, high_stage = self._guidance_stages
+            if low_stage >= high_stage:
+                raise ValueError('guidance_stages must be ordered low->high, e.g. [2, 3].')
+            for stage_idx in self._guidance_stages:
+                if stage_idx not in out_indices:
+                    raise ValueError('guidance_stages must be included in out_indices.')
 
         # Disable parent preload and use explicit research loader for clarity.
         super().__init__(
@@ -155,6 +217,16 @@ class RSLightMambaBackbone(Backbone_VSSM):
         if self._ig_scan_stages:
             self._upgrade_to_ig_scan()
         self._hf_map_extractor = SpatialHighFrequencyExtractor()
+        self._guidance_head: CrossStageGuidanceHead | None = None
+        if self._output_guidance_map:
+            low_stage, high_stage = self._guidance_stages
+            self._guidance_head = CrossStageGuidanceHead(
+                low_dim=self.dims[low_stage],
+                high_dim=self.dims[high_stage],
+                hidden_dim=self._guidance_hidden_dim,
+                lk_size=self._guidance_lk_size,
+                norm_type=self._guidance_norm_type,
+                gn_groups=self._guidance_gn_groups)
         if self._attention_fg_stage is not None:
             self._attention_importance_head = ForegroundHead(
                 d_inner=self.dims[self._attention_fg_stage],
@@ -230,7 +302,8 @@ class RSLightMambaBackbone(Backbone_VSSM):
             attn_drop=self._attention_attn_drop,
             proj_drop=self._attention_proj_drop,
             use_checkpoint=getattr(old_block, 'use_checkpoint', False),
-            channel_first=self.channel_first)
+            channel_first=self.channel_first,
+            use_pos_embed=self._attention_use_pos_embed)
 
     def _upgrade_to_attention_stages(self):
         replaced = 0
@@ -400,16 +473,19 @@ class RSLightMambaBackbone(Backbone_VSSM):
         return torch.stack(batch_fg, dim=0)
 
     def set_ig_targets(self, batch_data_samples, input_shape, device=None) -> None:
-        if not self._ig_modules and not self._attention_use_fg_loss:
+        if (not self._ig_modules and not self._attention_use_fg_loss
+                and not self._guidance_use_fg_loss):
             return
 
         device = device or next(self.parameters()).device
         fg_target = None
-        if self._ig_use_fg_loss or self._attention_use_fg_loss:
+        if self._ig_use_fg_loss or self._attention_use_fg_loss or self._guidance_use_fg_loss:
             fg_target = self._build_fg_target(batch_data_samples, input_shape, device)
         self._current_fg_target = fg_target
         self._last_attention_importance = None
         self._last_attention_fg_loss = None
+        self._last_guidance_map = None
+        self._last_guidance_fg_loss = None
 
         for module in self._ig_modules:
             module.reset_runtime_state()
@@ -420,6 +496,8 @@ class RSLightMambaBackbone(Backbone_VSSM):
         self._last_attention_importance = None
         self._last_attention_fg_loss = None
         self._last_hf_maps = ()
+        self._last_guidance_map = None
+        self._last_guidance_fg_loss = None
         for module in self._ig_modules:
             module.clear_fg_target()
             module.reset_runtime_state()
@@ -429,6 +507,8 @@ class RSLightMambaBackbone(Backbone_VSSM):
         self._ig_fg_loss_weight = safe_weight
         if self._attention_use_fg_loss:
             self._attention_fg_loss_weight = safe_weight
+        if self._guidance_use_fg_loss:
+            self._guidance_loss_weight = safe_weight
         for module in self._ig_modules:
             module.set_fg_loss_weight(safe_weight)
 
@@ -436,21 +516,34 @@ class RSLightMambaBackbone(Backbone_VSSM):
                                    importance: torch.Tensor) -> torch.Tensor | None:
         if self._current_fg_target is None or not self._attention_use_fg_loss:
             return None
+        return self._compute_shared_fg_loss(importance, self._attention_fg_loss_weight)
+
+    def _compute_guidance_fg_loss(self,
+                                  guidance_map: torch.Tensor) -> torch.Tensor | None:
+        if self._current_fg_target is None or not self._guidance_use_fg_loss:
+            return None
+        return self._compute_shared_fg_loss(guidance_map, self._guidance_loss_weight)
+
+    def _compute_shared_fg_loss(self,
+                                pred_map: torch.Tensor,
+                                loss_weight: float) -> torch.Tensor | None:
+        if self._current_fg_target is None or loss_weight <= 0:
+            return None
 
         fg_target = self._current_fg_target.to(
-            device=importance.device, dtype=importance.dtype)
-        if fg_target.shape[-2:] != importance.shape[-2:]:
+            device=pred_map.device, dtype=pred_map.dtype)
+        if fg_target.shape[-2:] != pred_map.shape[-2:]:
             fg_target = torch.nn.functional.interpolate(
                 fg_target,
-                size=importance.shape[-2:],
+                size=pred_map.shape[-2:],
                 mode='area')
             fg_target = fg_target.clamp(0.0, 1.0)
 
-        with torch.amp.autocast(device_type=importance.device.type, enabled=False):
+        with torch.amp.autocast(device_type=pred_map.device.type, enabled=False):
             loss = torch.nn.functional.binary_cross_entropy(
-                importance.float(),
+                pred_map.float(),
                 fg_target.float())
-        return loss * self._attention_fg_loss_weight
+        return loss * loss_weight
 
     def get_ig_aux_losses(self) -> dict:
         loss_values = []
@@ -462,6 +555,8 @@ class RSLightMambaBackbone(Backbone_VSSM):
 
         if self._last_attention_fg_loss is not None:
             loss_values.append(self._last_attention_fg_loss)
+        if self._last_guidance_fg_loss is not None:
+            loss_values.append(self._last_guidance_fg_loss)
 
         self.clear_ig_targets()
         if not loss_values:
@@ -472,6 +567,9 @@ class RSLightMambaBackbone(Backbone_VSSM):
     def get_last_hf_maps(self) -> tuple[torch.Tensor, ...]:
         return self._last_hf_maps
 
+    def get_last_guidance_map(self) -> torch.Tensor | None:
+        return self._last_guidance_map
+
     def forward(self, x):
         def layer_forward(layer, hidden):
             hidden = layer.blocks(hidden)
@@ -481,6 +579,7 @@ class RSLightMambaBackbone(Backbone_VSSM):
         x = self.patch_embed(x)
         outs = []
         hf_maps = []
+        stage_outputs = {}
         for stage_idx, layer in enumerate(self.layers):
             stage_out, x = layer_forward(layer, x)
             if stage_idx in self.out_indices:
@@ -489,6 +588,7 @@ class RSLightMambaBackbone(Backbone_VSSM):
                 if not self.channel_first:
                     out = out.permute(0, 3, 1, 2)
                 out = out.contiguous()
+                stage_outputs[stage_idx] = out
 
                 if (self._attention_importance_head is not None
                         and stage_idx == self._attention_fg_stage):
@@ -503,7 +603,15 @@ class RSLightMambaBackbone(Backbone_VSSM):
 
         if len(self.out_indices) == 0:
             return x
+        if self._output_guidance_map and self._guidance_head is not None:
+            low_stage, high_stage = self._guidance_stages
+            self._last_guidance_map = self._guidance_head(
+                stage_outputs[low_stage], stage_outputs[high_stage])
+            self._last_guidance_fg_loss = self._compute_guidance_fg_loss(
+                self._last_guidance_map)
         if self._output_hf_maps:
             self._last_hf_maps = tuple(hf_maps)
             return tuple(outs), self._last_hf_maps
+        if self._output_guidance_map:
+            return tuple(outs), self._last_guidance_map
         return tuple(outs)

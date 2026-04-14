@@ -19,11 +19,22 @@ class RSGlobalAttentionBlock(nn.Module):
                  proj_drop: float = 0.0,
                  act_layer: type[nn.Module] = nn.GELU,
                  use_checkpoint: bool = False,
-                 channel_first: bool = False):
+                 channel_first: bool = False,
+                 use_pos_embed: bool = True):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.channel_first = channel_first
         self.use_checkpoint = use_checkpoint
+        self.use_pos_embed = use_pos_embed
+        self.pos_embed = None
+        if self.use_pos_embed:
+            self.pos_embed = nn.Conv2d(
+                hidden_dim,
+                hidden_dim,
+                kernel_size=3,
+                padding=1,
+                groups=hidden_dim,
+                bias=True)
 
         self.norm1 = nn.LayerNorm(hidden_dim)
         self.attn = nn.MultiheadAttention(
@@ -63,7 +74,19 @@ class RSGlobalAttentionBlock(nn.Module):
         batch_size, height, width, channels = shape
         return tokens.reshape(batch_size, height, width, channels)
 
+    def _apply_pos_embed(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.use_pos_embed:
+            return x
+
+        if self.channel_first:
+            return x + self.pos_embed(x)
+
+        x_cf = x.permute(0, 3, 1, 2).contiguous()
+        x_cf = x_cf + self.pos_embed(x_cf)
+        return x_cf.permute(0, 2, 3, 1).contiguous()
+
     def _forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self._apply_pos_embed(x)
         tokens, shape = self._flatten(x)
 
         attn_input = self.norm1(tokens)

@@ -21,8 +21,8 @@ export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 
 # If no new log output for this long, treat as hang and restart.
-STALL_TIMEOUT_SECONDS="${STALL_TIMEOUT_SECONDS:-1800}"
-STALL_CHECK_INTERVAL_SECONDS="${STALL_CHECK_INTERVAL_SECONDS:-30}"
+STALL_TIMEOUT_SECONDS="${STALL_TIMEOUT_SECONDS:-120}"
+STALL_CHECK_INTERVAL_SECONDS="${STALL_CHECK_INTERVAL_SECONDS:-10}"
 
 pick_resume_ckpt() {
   if [ -f "$WORKDIR/last_checkpoint" ]; then
@@ -65,9 +65,10 @@ run_with_watchdog() {
   printf -v cmd_str '%q ' "${train_cmd[@]}"
 
   # Run train command as a separate process group so we can kill the whole
-  # pipeline (python + tee) when no log progress is observed.
+  # pipeline (python + tee) when no log progress is observed. Keep pipefail
+  # enabled inside the child shell so python failures are not masked by tee.
   set +e
-  setsid bash -lc "$cmd_str 2>&1 | tee -a '$RUNNER_LOG' '$run_log'" &
+  setsid bash -lc "set -o pipefail; $cmd_str 2>&1 | tee -a '$RUNNER_LOG' '$run_log'" &
   child_pid=$!
   child_pgid=$child_pid
   set -e
@@ -122,7 +123,7 @@ while true; do
   run_log="$WORKDIR/auto_logs/run_$ts.log"
   resume_ckpt="$(pick_resume_ckpt)"
 
-  echo "[$(date '+%F %T')] attempt=$attempt session=${SESSION_NAME:-<none>} resume=${resume_ckpt:-<none>}" | tee -a "$RUNNER_LOG" "$run_log"
+  echo "[$(date '+%F %T')] attempt=$attempt session=${SESSION_NAME:-<none>} resume=${resume_ckpt:-<none>} stall_timeout=${STALL_TIMEOUT_SECONDS}s stall_check_interval=${STALL_CHECK_INTERVAL_SECONDS}s" | tee -a "$RUNNER_LOG" "$run_log"
 
   train_cmd=(python tools/train.py "$CONFIG" --work-dir "$WORKDIR")
   if [ -n "$resume_ckpt" ]; then

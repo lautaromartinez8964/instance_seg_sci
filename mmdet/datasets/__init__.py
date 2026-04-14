@@ -15,6 +15,7 @@ from .deepfashion import DeepFashionDataset
 from .dod import DODDataset
 from .dsdl import DSDLDetDataset
 from .flickr30k import Flickr30kDataset
+from .gravel_dataset import GravelDataset
 from .isaid import iSAIDDataset
 from .lvis import LVISDataset, LVISV1Dataset, LVISV05Dataset
 from .mdetr_style_refcoco import MDETRStyleRefCocoDataset
@@ -48,6 +49,6 @@ __all__ = [
     'ADE20KPanopticDataset', 'CocoCaptionDataset', 'RefCocoDataset',
     'BaseSegDataset', 'ADE20KSegDataset', 'CocoSegDataset',
     'ADE20KInstanceDataset', 'iSAIDDataset', 'V3DetDataset', 'ConcatDataset',
-    'ODVGDataset', 'MDETRStyleRefCocoDataset', 'DODDataset',
+    'ODVGDataset', 'MDETRStyleRefCocoDataset', 'DODDataset', 'GravelDataset',
     'CustomSampleSizeSampler', 'Flickr30kDataset'
 ]
