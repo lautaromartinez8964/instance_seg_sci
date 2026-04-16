@@ -1,0 +1,1 @@
+{"coco/segm_mAP": 0.276, "coco/segm_mAP_50": 0.416, "coco/segm_mAP_75": 0.327, "coco/segm_mAP_s": 0.243, "coco/segm_mAP_m": 0.579, "coco/segm_mAP_l": 0.584, "data_time": 0.0639081706806105, "time": 0.0989442236569463, "step": 0}

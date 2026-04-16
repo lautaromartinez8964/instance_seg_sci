@@ -19,6 +19,9 @@ RUNNER_LOG="$WORKDIR/auto_restart_runner.log"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export PYTHONFAULTHANDLER=1
 
 # If no new log output for this long, treat as hang and restart.
 STALL_TIMEOUT_SECONDS="${STALL_TIMEOUT_SECONDS:-120}"
@@ -112,8 +115,10 @@ run_with_watchdog() {
     sleep "$STALL_CHECK_INTERVAL_SECONDS"
   done
 
+  set +e
   wait "$child_pid"
-  return $?
+  local child_exit_code=$?
+  return "$child_exit_code"
 }
 
 attempt=0
@@ -125,7 +130,7 @@ while true; do
 
   echo "[$(date '+%F %T')] attempt=$attempt session=${SESSION_NAME:-<none>} resume=${resume_ckpt:-<none>} stall_timeout=${STALL_TIMEOUT_SECONDS}s stall_check_interval=${STALL_CHECK_INTERVAL_SECONDS}s" | tee -a "$RUNNER_LOG" "$run_log"
 
-  train_cmd=(python tools/train.py "$CONFIG" --work-dir "$WORKDIR")
+  train_cmd=(python -X faulthandler tools/train.py "$CONFIG" --work-dir "$WORKDIR")
   if [ -n "$resume_ckpt" ]; then
     train_cmd+=(--resume "$resume_ckpt")
   fi

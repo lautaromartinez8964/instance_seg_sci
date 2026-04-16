@@ -41,6 +41,8 @@ weights/
 
 # 训练输出目录
 work_dirs/
+work_dirs_gravel/
+work_dirs_gravel_big/
 outputs/
 runs/
 logs/

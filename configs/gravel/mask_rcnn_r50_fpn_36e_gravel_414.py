@@ -46,6 +46,20 @@ default_hooks = dict(
     sampler_seed=dict(type='DistSamplerSeedHook'),
     visualization=dict(type='DetVisualizationHook'))
 
+val_evaluator = dict(
+    type='FasterCocoMetric',
+    ann_file='data/gravel_roboflow_414_mmdet/annotations/instances_val.json',
+    metric='segm',
+    format_only=False,
+    backend_args=None)
+
+test_evaluator = dict(
+    type='FasterCocoMetric',
+    ann_file='data/gravel_roboflow_414_mmdet/annotations/instances_test.json',
+    metric='segm',
+    format_only=False,
+    backend_args=None)
+
 env_cfg = dict(
     cudnn_benchmark=False,
     mp_cfg=dict(mp_start_method='fork', opencv_num_threads=0),
