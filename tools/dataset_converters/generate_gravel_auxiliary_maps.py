@@ -87,6 +87,20 @@ def generate_inter_instance_boundary(
     mask_stack = np.stack(instance_masks, axis=0).astype(bool)
     occupancy = mask_stack.sum(axis=0)
     height, width = instance_masks[0].shape
+    valid_instance_count = int(np.count_nonzero(mask_stack.reshape(mask_stack.shape[0], -1).any(axis=1)))
+    instance_density = valid_instance_count * 10000.0 / (height * width)
+
+    if instance_density >= 10.0:
+        seam_neighbors = ((1, 0), (-1, 0), (0, 1), (0, -1))
+        local_expansion_radius = max(1, expansion_radius - 1)
+        gap_threshold = 1.0
+    else:
+        seam_neighbors = (
+            (1, 0), (-1, 0), (0, 1), (0, -1),
+            (1, 1), (-1, -1), (1, -1), (-1, 1),
+        )
+        local_expansion_radius = expansion_radius
+        gap_threshold = 1.0
 
     # Overlapped annotation pixels are treated as ambiguous and excluded from
     # the seeds so they do not create solid boundary blobs.
@@ -117,12 +131,11 @@ def generate_inter_instance_boundary(
         label_map == 0, return_indices=True)
     nearest_labels = label_map[tuple(indices)]
     expanded_labels = np.where(
-        distances <= expansion_radius, nearest_labels, 0).astype(np.int32)
+        distances <= local_expansion_radius, nearest_labels, 0).astype(np.int32)
 
     exact_seam = np.zeros((height, width), dtype=bool)
     center = expanded_labels[1:-1, 1:-1]
-    for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1),
-                   (1, 1), (-1, -1), (1, -1), (-1, 1)):
+    for dy, dx in seam_neighbors:
         neighbor = expanded_labels[
             1 + dy:height - 1 + dy,
             1 + dx:width - 1 + dx,
@@ -131,15 +144,27 @@ def generate_inter_instance_boundary(
             (center > 0) & (neighbor > 0) & (center != neighbor)
         )
 
-    # Keep the exact Voronoi seam and widen it slightly for learnability,
-    # while never letting the target drift into object interiors.
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    thick_seam = cv2.dilate(
-        exact_seam.astype(np.uint8), kernel, iterations=1).astype(bool)
-
+    # Treat soil gaps and direct-contact seams differently: soil gaps can be
+    # widened slightly for learnability, while overlap/contact seams stay thin
+    # so small stones are not swallowed by the target.
     all_instances_union = occupancy > 0
     overlap_region = occupancy >= 2
-    boundary_final = thick_seam & ((~all_instances_union) | overlap_region)
+
+    background_seam = exact_seam & (~all_instances_union)
+    overlap_seam = exact_seam & overlap_region
+
+    # Only widen seams in sufficiently wide soil gaps. Narrow gaps stay as a
+    # hairline so dense small stones are not overwhelmed by the label.
+    background_gap_distance = ndimage.distance_transform_edt(~all_instances_union)
+    wide_background_gap = background_gap_distance > gap_threshold
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    thick_background_seam = cv2.dilate(
+        background_seam.astype(np.uint8), kernel, iterations=1).astype(bool)
+    thick_background_seam &= ~all_instances_union
+    thick_background_seam &= wide_background_gap
+
+    boundary_final = background_seam | thick_background_seam | overlap_seam
     return boundary_final.astype(np.uint8) * 255
 
 
@@ -337,3 +362,17 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
+    
+    
+"""
+1. 宏观：全局密度自适应（判断是“拥挤区”还是“稀疏区”）
+◦ 代码算出了 instance_density。
+◦ 如果石头很密（>= 10.0）：网络自动降低膨胀半径（expansion_radius - 1），且只用 4 邻域找缝隙。这就保证了在密密麻麻的小碎石堆里，接缝线“细如发丝”，绝对不会淹没小石头。
+◦ 如果石头较稀疏：保持原半径，用 8 邻域，确保线段连贯。
+2. 中观：精确的 Voronoi 势力划分
+◦ 利用距离变换，绝对公平地找出每两块石头势力范围碰撞的“精确 1 像素分界线（exact_seam）”。
+3. 微观：智能泥土填充（最绝的一步！）
+◦ 代码把缝隙分成了两类：overlap_seam（两块石头物理上已经贴贴了）和 background_seam（两块石头中间隔着泥土）。
+◦ 核心制约：它测量了泥土的宽度（background_gap_distance）。只有当泥土缝隙足够宽（> gap_threshold）时，它才允许对缝隙进行 3x3 的加粗（thick_background_seam）。如果是很窄的缝隙，保持 1 像素！
+◦ 这完美做到了：宽缝隙填满泥土（增加正样本可学性），窄缝隙保留骨架（保护小目标主体）！
+"""
