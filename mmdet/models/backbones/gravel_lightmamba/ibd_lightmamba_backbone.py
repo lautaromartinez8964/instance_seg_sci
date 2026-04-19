@@ -45,6 +45,36 @@ class InterBoundaryDetectionHead(nn.Module):
         return self.predictor(self.fuse(fused))
 
 
+class BoundaryConditionedResidualBlock(nn.Module):
+    """Refine interior responses while suppressing cross-boundary mixing."""
+
+    def __init__(self, dim: int, detach_boundary: bool = True) -> None:
+        super().__init__()
+        self.detach_boundary = detach_boundary
+        self.interior_enhance = nn.Sequential(
+            nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim, bias=False),
+            nn.BatchNorm2d(dim),
+            nn.GELU(),
+            nn.Conv2d(dim, dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(dim))
+        self.alpha = nn.Parameter(torch.zeros(1))
+
+    def forward(self, feat: torch.Tensor,
+                boundary_prob: torch.Tensor) -> torch.Tensor:
+        if self.detach_boundary:
+            boundary_prob = boundary_prob.detach()
+        if boundary_prob.shape[-2:] != feat.shape[-2:]:
+            boundary_prob = F.interpolate(
+                boundary_prob,
+                size=feat.shape[-2:],
+                mode='bilinear',
+                align_corners=False)
+        boundary_prob = boundary_prob.to(device=feat.device, dtype=feat.dtype).clamp_(0.0, 1.0)
+        interior_mask = 1.0 - boundary_prob
+        refined = feat + self.interior_enhance(feat) * interior_mask
+        return feat + torch.tanh(self.alpha) * (refined - feat)
+
+
 @MODELS.register_module()
 class GravelLightMambaIBDBackbone(RSLightMambaBackbone):
     """RSLightMamba backbone with an IBD auxiliary branch for dense gravel."""
@@ -56,24 +86,38 @@ class GravelLightMambaIBDBackbone(RSLightMambaBackbone):
                  ibd_bce_weight: float = 1.0,
                  ibd_dice_weight: float = 1.0,
                  ibd_max_pos_weight: float = 8.0,
+                 bcra_stages: Sequence[int] = (),
+                 bcra_detach_boundary: bool = True,
                  **kwargs) -> None:
         self._ibd_stages = tuple(ibd_stages)
         if len(self._ibd_stages) != 2:
             raise ValueError('ibd_stages must contain exactly two stage indices.')
         if self._ibd_stages[0] >= self._ibd_stages[1]:
             raise ValueError('ibd_stages must be ordered from low to high stage.')
+        self._bcra_stages = tuple(sorted(set(bcra_stages)))
 
         super().__init__(**kwargs)
 
         for stage_idx in self._ibd_stages:
             if stage_idx not in self.out_indices:
                 raise ValueError('ibd_stages must be included in out_indices.')
+        for stage_idx in self._bcra_stages:
+            if stage_idx not in self.out_indices:
+                raise ValueError('bcra_stages must be included in out_indices.')
+            if stage_idx <= self._ibd_stages[1]:
+                raise ValueError('bcra_stages must be deeper than the IBD high stage.')
 
         low_stage, high_stage = self._ibd_stages
         self.ibd_head = InterBoundaryDetectionHead(
             low_dim=self.dims[low_stage],
             high_dim=self.dims[high_stage],
             hidden_dim=ibd_hidden_dim)
+        self.bcra_blocks = nn.ModuleDict({
+            str(stage_idx): BoundaryConditionedResidualBlock(
+                dim=self.dims[stage_idx],
+                detach_boundary=bcra_detach_boundary)
+            for stage_idx in self._bcra_stages
+        })
 
         self._ibd_loss_weight = float(max(ibd_loss_weight, 0.0))
         self._ibd_bce_weight = float(max(ibd_bce_weight, 0.0))
@@ -128,34 +172,32 @@ class GravelLightMambaIBDBackbone(RSLightMambaBackbone):
 
         boundary_target = self._current_boundary_target.to(
             device=boundary_logits.device, dtype=boundary_logits.dtype)
-        if boundary_target.shape[-2:] != boundary_logits.shape[-2:]:
-            boundary_target = F.interpolate(
-                boundary_target,
-                size=boundary_logits.shape[-2:],
-                mode='nearest')
+        loss_logits = boundary_logits
+        if loss_logits.shape[-2:] != boundary_target.shape[-2:]:
+            loss_logits = F.interpolate(
+                loss_logits,
+                size=boundary_target.shape[-2:],
+                mode='bilinear',
+                align_corners=False)
 
         positive = boundary_target.sum()
         negative = boundary_target.numel() - positive
         pos_weight = (negative / positive.clamp_min(1.0)).clamp(
             min=1.0, max=self._ibd_max_pos_weight)
-        pixel_weight = torch.where(
-            boundary_target > 0.5,
-            torch.full_like(boundary_target, pos_weight),
-            torch.ones_like(boundary_target))
 
         with torch.amp.autocast(device_type=boundary_logits.device.type, enabled=False):
             bce = F.binary_cross_entropy_with_logits(
-                boundary_logits.float(),
+                loss_logits.float(),
                 boundary_target.float(),
-                reduction='none')
-            weighted_bce = (bce * pixel_weight.float()).sum() / pixel_weight.sum().clamp_min(1.0)
+                pos_weight=pos_weight.float(),
+                reduction='mean')
 
-            boundary_prob = boundary_logits.float().sigmoid()
+            boundary_prob = loss_logits.float().sigmoid()
             intersection = (boundary_prob * boundary_target.float()).sum(dim=(1, 2, 3))
             union = boundary_prob.sum(dim=(1, 2, 3)) + boundary_target.float().sum(dim=(1, 2, 3))
             dice = 1.0 - (2.0 * intersection + 1.0) / (union + 1.0)
 
-        loss = self._ibd_bce_weight * weighted_bce + self._ibd_dice_weight * dice.mean()
+        loss = self._ibd_bce_weight * bce + self._ibd_dice_weight * dice.mean()
         return loss * self._ibd_loss_weight
 
     def get_auxiliary_losses(self) -> dict:
@@ -168,6 +210,16 @@ class GravelLightMambaIBDBackbone(RSLightMambaBackbone):
     def get_last_boundary_logits(self) -> torch.Tensor | None:
         return self._last_boundary_logits
 
+    def _maybe_compute_boundary(self, stage_outputs: dict[int, torch.Tensor]) -> None:
+        low_stage, high_stage = self._ibd_stages
+        if self._last_boundary_logits is not None:
+            return
+        if low_stage not in stage_outputs or high_stage not in stage_outputs:
+            return
+        self._last_boundary_logits = self.ibd_head(
+            stage_outputs[low_stage], stage_outputs[high_stage])
+        self._last_boundary_loss = self._compute_ibd_loss(self._last_boundary_logits)
+
     def forward(self, x):
         def layer_forward(layer, hidden):
             hidden = layer.blocks(hidden)
@@ -178,6 +230,8 @@ class GravelLightMambaIBDBackbone(RSLightMambaBackbone):
         outs = []
         hf_maps = []
         stage_outputs = {}
+        self._last_boundary_logits = None
+        self._last_boundary_loss = None
         for stage_idx, layer in enumerate(self.layers):
             stage_out, x = layer_forward(layer, x)
             if stage_idx in self.out_indices:
@@ -186,6 +240,15 @@ class GravelLightMambaIBDBackbone(RSLightMambaBackbone):
                 if not self.channel_first:
                     out = out.permute(0, 3, 1, 2)
                 out = out.contiguous()
+
+                if stage_idx == self._ibd_stages[1]:
+                    stage_outputs[stage_idx] = out
+                    self._maybe_compute_boundary(stage_outputs)
+                    out = stage_outputs[stage_idx]
+                elif stage_idx in self._bcra_stages and self._last_boundary_logits is not None:
+                    boundary_prob = self._last_boundary_logits.float().sigmoid()
+                    out = self.bcra_blocks[str(stage_idx)](out, boundary_prob)
+
                 stage_outputs[stage_idx] = out
 
                 if (self._attention_importance_head is not None
@@ -202,10 +265,7 @@ class GravelLightMambaIBDBackbone(RSLightMambaBackbone):
         if len(self.out_indices) == 0:
             return x
 
-        low_stage, high_stage = self._ibd_stages
-        self._last_boundary_logits = self.ibd_head(
-            stage_outputs[low_stage], stage_outputs[high_stage])
-        self._last_boundary_loss = self._compute_ibd_loss(self._last_boundary_logits)
+        self._maybe_compute_boundary(stage_outputs)
 
         if self._output_guidance_map and self._guidance_head is not None:
             guide_low_stage, guide_high_stage = self._guidance_stages
