@@ -27,6 +27,21 @@ class RSMaskRCNN(MaskRCNN):
         if hasattr(self.backbone, 'clear_auxiliary_targets'):
             self.backbone.clear_auxiliary_targets()
 
+    def _set_neck_auxiliary_targets(self, batch_inputs: Tensor,
+                                    batch_data_samples: SampleList) -> None:
+        if hasattr(self, 'neck') and hasattr(self.neck, 'set_auxiliary_targets'):
+            self.neck.set_auxiliary_targets(
+                batch_data_samples, device=batch_inputs.device)
+
+    def _get_neck_auxiliary_losses(self) -> dict:
+        if hasattr(self, 'neck') and hasattr(self.neck, 'get_auxiliary_losses'):
+            return self.neck.get_auxiliary_losses()
+        return {}
+
+    def _clear_neck_auxiliary_targets(self) -> None:
+        if hasattr(self, 'neck') and hasattr(self.neck, 'clear_auxiliary_targets'):
+            self.neck.clear_auxiliary_targets()
+
     def _set_ig_targets(self, batch_inputs: Tensor,
                         batch_data_samples: SampleList) -> None:
         if hasattr(self.backbone, 'set_ig_targets'):
@@ -47,9 +62,11 @@ class RSMaskRCNN(MaskRCNN):
     def loss(self, batch_inputs: Tensor,
              batch_data_samples: SampleList) -> dict:
         self._set_backbone_auxiliary_targets(batch_inputs, batch_data_samples)
+        self._set_neck_auxiliary_targets(batch_inputs, batch_data_samples)
         self._set_ig_targets(batch_inputs, batch_data_samples)
         losses = super().loss(batch_inputs, batch_data_samples)
         losses.update(self._get_backbone_auxiliary_losses())
+        losses.update(self._get_neck_auxiliary_losses())
         losses.update(self._get_ig_aux_losses())
         return losses
 
@@ -58,11 +75,13 @@ class RSMaskRCNN(MaskRCNN):
                 batch_data_samples: SampleList,
                 rescale: bool = True) -> SampleList:
         self._clear_backbone_auxiliary_targets()
+        self._clear_neck_auxiliary_targets()
         self._clear_ig_targets()
         return super().predict(batch_inputs, batch_data_samples, rescale=rescale)
 
     def _forward(self, batch_inputs: Tensor,
                  batch_data_samples: SampleList) -> tuple:
         self._clear_backbone_auxiliary_targets()
+        self._clear_neck_auxiliary_targets()
         self._clear_ig_targets()
         return super()._forward(batch_inputs, batch_data_samples)
