@@ -43,9 +43,25 @@ def parse_args() -> argparse.Namespace:
         help='Expansion radius in pixels used to grow unique instance seeds '
         'before extracting their separating seam map.')
     parser.add_argument(
+        '--boundary-band-radius',
+        type=int,
+        default=2,
+        help='Extra dilation radius used to convert the thin core seam into '
+        'a support band for tolerant supervision.')
+    parser.add_argument(
         '--save-dt-npy',
         action='store_true',
         help='Also save float32 distance transform maps as .npy files.')
+    parser.add_argument(
+        '--splits',
+        nargs='+',
+        choices=tuple(SPLIT_LAYOUT.keys()),
+        default=list(SPLIT_LAYOUT.keys()),
+        help='Dataset splits to generate. Defaults to all splits.')
+    parser.add_argument(
+        '--skip-preview',
+        action='store_true',
+        help='Skip preview image generation to accelerate offline label export.')
     parser.add_argument(
         '--overwrite',
         action='store_true',
@@ -80,7 +96,7 @@ def segmentation_to_mask(segmentation: Any, height: int, width: int) -> np.ndarr
 def generate_inter_instance_boundary(
     instance_masks: list[np.ndarray],
     expansion_radius: int,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     if not instance_masks:
         raise ValueError('instance_masks must not be empty.')
 
@@ -125,7 +141,8 @@ def generate_inter_instance_boundary(
         label_map[seed_y, seed_x] = idx
 
     if not np.any(label_map):
-        return np.zeros((height, width), dtype=np.uint8)
+        empty = np.zeros((height, width), dtype=np.uint8)
+        return empty, empty, empty
 
     distances, indices = ndimage.distance_transform_edt(
         label_map == 0, return_indices=True)
@@ -164,8 +181,10 @@ def generate_inter_instance_boundary(
     thick_background_seam &= ~all_instances_union
     thick_background_seam &= wide_background_gap
 
-    boundary_final = background_seam | thick_background_seam | overlap_seam
-    return boundary_final.astype(np.uint8) * 255
+    boundary_core = (background_seam | overlap_seam).astype(np.uint8)
+    boundary_band = (background_seam | thick_background_seam | overlap_seam).astype(np.uint8)
+    combined = boundary_band.copy()
+    return boundary_core * 255, boundary_band * 255, combined * 255
 
 
 def generate_distance_transform_map(instance_masks: list[np.ndarray]) -> np.ndarray:
@@ -202,7 +221,8 @@ def write_npy(path: Path, array: np.ndarray, overwrite: bool) -> None:
 
 def make_preview(
     image_path: Path,
-    boundary_map: np.ndarray,
+    boundary_core: np.ndarray,
+    boundary_band: np.ndarray,
     dt_map: np.ndarray,
     output_path: Path,
     overwrite: bool,
@@ -215,9 +235,13 @@ def make_preview(
         raise FileNotFoundError(f'Failed to read image: {image_path}')
 
     boundary_overlay = image.copy()
-    boundary_pixels = boundary_map > 0
-    boundary_overlay[boundary_pixels] = (
-        0.35 * boundary_overlay[boundary_pixels] + 0.65 * np.array([0, 0, 255])
+    band_pixels = boundary_band > 0
+    core_pixels = boundary_core > 0
+    boundary_overlay[band_pixels] = (
+        0.55 * boundary_overlay[band_pixels] + 0.45 * np.array([0, 200, 255])
+    ).astype(np.uint8)
+    boundary_overlay[core_pixels] = (
+        0.20 * boundary_overlay[core_pixels] + 0.80 * np.array([0, 0, 255])
     ).astype(np.uint8)
 
     dt_uint8 = np.clip(dt_map * 255.0, 0, 255).astype(np.uint8)
@@ -228,7 +252,7 @@ def make_preview(
     panel_width = image.shape[1]
     cv2.putText(preview, 'image', (16, 32), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
                 (255, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(preview, 'boundary', (panel_width + 16, 32),
+    cv2.putText(preview, 'boundary core+band', (panel_width + 16, 32),
                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2,
                 cv2.LINE_AA)
     cv2.putText(preview, 'distance-transform', (panel_width * 2 + 16, 32),
@@ -246,7 +270,9 @@ def process_split(
     label_root: Path,
     vis_root: Path,
     expansion_radius: int,
+    band_radius: int,
     save_dt_npy: bool,
+    skip_preview: bool,
     overwrite: bool,
 ) -> dict[str, Any]:
     coco = load_coco(ann_path)
@@ -257,6 +283,8 @@ def process_split(
     split_summary: dict[str, Any] = {
         'images': 0,
         'annotations': len(coco.get('annotations', [])),
+        'boundary_core_dir': str((label_root / split / 'boundary_core').as_posix()),
+        'boundary_band_dir': str((label_root / split / 'boundary_band').as_posix()),
         'boundary_dir': str((label_root / split / 'boundary').as_posix()),
         'distance_dir': str((label_root / split / 'distance_transform').as_posix()),
         'preview_dir': str((vis_root / split).as_posix()),
@@ -278,14 +306,23 @@ def process_split(
             segmentation_to_mask(ann['segmentation'], height, width)
             for ann in anns
         ]
-        boundary_map = generate_inter_instance_boundary(
+        boundary_core, boundary_band, boundary_map = generate_inter_instance_boundary(
             instance_masks, expansion_radius)
+        if band_radius > 0:
+            kernel_size = band_radius * 2 + 1
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+            boundary_band = cv2.dilate(boundary_core, kernel, iterations=1)
+            boundary_band = np.maximum(boundary_band, boundary_map)
         dt_map = generate_distance_transform_map(instance_masks)
 
+        boundary_core_path = label_root / split / 'boundary_core' / f'{Path(image_name).stem}.png'
+        boundary_band_path = label_root / split / 'boundary_band' / f'{Path(image_name).stem}.png'
         boundary_path = label_root / split / 'boundary' / f'{Path(image_name).stem}.png'
         dt_png_path = label_root / split / 'distance_transform' / f'{Path(image_name).stem}.png'
         preview_path = vis_root / split / image_name
 
+        write_map_png(boundary_core_path, boundary_core, overwrite)
+        write_map_png(boundary_band_path, boundary_band, overwrite)
         write_map_png(boundary_path, boundary_map, overwrite)
         write_map_png(
             dt_png_path,
@@ -297,11 +334,14 @@ def process_split(
             dt_npy_path = label_root / split / 'distance_transform_npy' / f'{Path(image_name).stem}.npy'
             write_npy(dt_npy_path, dt_map.astype(np.float32), overwrite)
 
-        make_preview(image_path, boundary_map, dt_map, preview_path, overwrite)
+        if not skip_preview:
+            make_preview(image_path, boundary_core, boundary_band, dt_map, preview_path, overwrite)
 
         manifest.append({
             'image_id': image_id,
             'image_file': str(image_path.as_posix()),
+            'boundary_core_file': str(boundary_core_path.as_posix()),
+            'boundary_band_file': str(boundary_band_path.as_posix()),
             'boundary_file': str(boundary_path.as_posix()),
             'distance_transform_png': str(dt_png_path.as_posix()),
             'distance_transform_npy': str(dt_npy_path.as_posix()) if dt_npy_path else None,
@@ -336,11 +376,14 @@ def main() -> None:
         'label_root': str(label_root.as_posix()),
         'visualization_root': str(vis_root.as_posix()),
         'boundary_dilation_radius': args.boundary_dilation_radius,
+        'boundary_band_radius': args.boundary_band_radius,
         'save_dt_npy': args.save_dt_npy,
+        'skip_preview': args.skip_preview,
         'splits': {},
     }
 
-    for split, (ann_relpath, image_subdir) in SPLIT_LAYOUT.items():
+    for split in args.splits:
+        ann_relpath, image_subdir = SPLIT_LAYOUT[split]
         summary['splits'][split] = process_split(
             split=split,
             ann_path=data_root / ann_relpath,
@@ -348,7 +391,9 @@ def main() -> None:
             label_root=label_root,
             vis_root=vis_root,
             expansion_radius=args.boundary_dilation_radius,
+            band_radius=args.boundary_band_radius,
             save_dt_npy=args.save_dt_npy,
+            skip_preview=args.skip_preview,
             overwrite=args.overwrite,
         )
 
@@ -364,6 +409,7 @@ if __name__ == '__main__':
     main()
     
     
+### 生成接缝线图
 """
 1. 宏观：全局密度自适应（判断是“拥挤区”还是“稀疏区”）
 ◦ 代码算出了 instance_density。
@@ -376,3 +422,18 @@ if __name__ == '__main__':
 ◦ 核心制约：它测量了泥土的宽度（background_gap_distance）。只有当泥土缝隙足够宽（> gap_threshold）时，它才允许对缝隙进行 3x3 的加粗（thick_background_seam）。如果是很窄的缝隙，保持 1 像素！
 ◦ 这完美做到了：宽缝隙填满泥土（增加正样本可学性），窄缝隙保留骨架（保护小目标主体）！
 """
+
+### 生成实例距离变换图
+"""
+第一步：基于单实例的内部距离变换（Inner Distance Transform） 你没有把所有石头的 Mask 合并成一张大二值图再去算距离，而是在一层 for mask in instance_masks: 循环里单独为每一块石头算距离。
+物理意义：它计算的是单块石头内部，每一个像素距离这块石头边缘的最短距离。越靠近石头中心，值越大；越靠近边缘，值越小（接近 0）。
+
+第二步：★ 神级操作：实例级极值归一化 (Instance-level Normalization) ★ 你用了 dist = dist / max_value！这绝对是神来之笔！
+如果不归一化会怎样？ 假设有一块巨大的石头，中心距离边缘 50 像素（峰值 50）；旁边有一块极小的碎石，中心距离边缘只有 3 像素（峰值 3）。如果直接输出，小石头在全局的距离图里几乎微不可见（才 0.06）。网络在学习时，会彻底忽略小石头，DF-FPN 也会因此对小目标失效。
+归一化的巨大威力：通过除以 max_value，无论这块石头是占了半个屏幕的巨石，还是只有 5x5 像素的砂砾，它们的中心点（Core）都会被强制拉升到绝对的 1.0！边缘全部是 0.0！
+对 DF-FPN 的意义：这完美实现了尺度无关性（Scale-Invariance）。你的网络学到的不再是绝对的“大小”，而是纯粹的“实例拓扑结构（Instance Topology）”——“不管多大，我只关心这里是石头的核心，还是石头的边缘。”
+
+第三步：无损融合 (np.maximum) 最后把所有单块石头的距离图用 np.maximum 融合成一张图。哪怕两块石头的 Mask 在标注时有一点点重叠，取最大值也能保证保留最强烈的“核心属性”。
+"""
+
+

@@ -49,6 +49,13 @@ class BoundaryConditionedResidualBlock(nn.Module):
     """Refine interior responses while suppressing cross-boundary mixing."""
 
     def __init__(self, dim: int, detach_boundary: bool = True) -> None:
+        """
+        初始化内部特征增强模块
+
+        Args:
+            dim (int): 输入特征通道数
+            detach_boundary (bool, optional): 是否对边界信息进行梯度截断，默认为True
+        """
         super().__init__()
         self.detach_boundary = detach_boundary
         self.interior_enhance = nn.Sequential(
@@ -86,6 +93,8 @@ class GravelLightMambaIBDBackbone(RSLightMambaBackbone):
                  ibd_bce_weight: float = 1.0,
                  ibd_dice_weight: float = 1.0,
                  ibd_max_pos_weight: float = 8.0,
+                 ibd_band_loss_weight: float = 0.35,
+                 ibd_far_neg_weight: float = 2.0,
                  bcra_stages: Sequence[int] = (),
                  bcra_detach_boundary: bool = True,
                  **kwargs) -> None:
@@ -123,35 +132,52 @@ class GravelLightMambaIBDBackbone(RSLightMambaBackbone):
         self._ibd_bce_weight = float(max(ibd_bce_weight, 0.0))
         self._ibd_dice_weight = float(max(ibd_dice_weight, 0.0))
         self._ibd_max_pos_weight = float(max(ibd_max_pos_weight, 1.0))
+        self._ibd_band_loss_weight = float(max(ibd_band_loss_weight, 0.0))
+        self._ibd_far_neg_weight = float(max(ibd_far_neg_weight, 1.0))
 
         self._current_boundary_target: torch.Tensor | None = None
         self._last_boundary_logits: torch.Tensor | None = None
         self._last_boundary_loss: torch.Tensor | None = None
 
     def _build_boundary_target(self, batch_data_samples, input_shape,
-                               device) -> torch.Tensor | None:
+                               device) -> dict[str, torch.Tensor] | None:
         if not batch_data_samples:
             return None
 
         target_h, target_w = input_shape
-        batch_targets = []
+        core_targets = []
+        band_targets = []
         for data_sample in batch_data_samples:
-            boundary_target = torch.zeros(
+            core_target = torch.zeros(
+                (1, target_h, target_w), dtype=torch.float32, device=device)
+            band_target = torch.zeros(
                 (1, target_h, target_w), dtype=torch.float32, device=device)
             if 'gt_sem_seg' in data_sample:
                 sem_seg = data_sample.gt_sem_seg.sem_seg.to(
                     device=device, dtype=torch.float32)
                 if sem_seg.ndim == 2:
                     sem_seg = sem_seg.unsqueeze(0)
+                elif sem_seg.ndim == 4 and sem_seg.shape[0] == 1:
+                    sem_seg = sem_seg.squeeze(0)
+                if sem_seg.ndim == 3 and sem_seg.shape[-1] <= 4 and sem_seg.shape[0] != sem_seg.shape[-1]:
+                    sem_seg = sem_seg.permute(2, 0, 1).contiguous()
                 sem_seg = (sem_seg > 0).float()
                 if sem_seg.shape[-2:] != (target_h, target_w):
                     sem_seg = F.interpolate(
                         sem_seg.unsqueeze(0),
                         size=(target_h, target_w),
                         mode='nearest').squeeze(0)
-                boundary_target = sem_seg
-            batch_targets.append(boundary_target)
-        return torch.stack(batch_targets, dim=0)
+                if sem_seg.shape[0] >= 2:
+                    core_target = sem_seg[0:1]
+                    band_target = sem_seg[1:2]
+                else:
+                    core_target = sem_seg[0:1]
+                    band_target = sem_seg[0:1]
+            core_targets.append(core_target)
+            band_targets.append(torch.maximum(band_target, core_target))
+        return dict(
+            core=torch.stack(core_targets, dim=0),
+            band=torch.stack(band_targets, dim=0))
 
     def set_auxiliary_targets(self, batch_data_samples, input_shape,
                               device=None) -> None:
@@ -170,34 +196,47 @@ class GravelLightMambaIBDBackbone(RSLightMambaBackbone):
         if self._current_boundary_target is None or self._ibd_loss_weight <= 0:
             return None
 
-        boundary_target = self._current_boundary_target.to(
+        core_target = self._current_boundary_target['core'].to(
+            device=boundary_logits.device, dtype=boundary_logits.dtype)
+        band_target = self._current_boundary_target['band'].to(
             device=boundary_logits.device, dtype=boundary_logits.dtype)
         loss_logits = boundary_logits
-        if loss_logits.shape[-2:] != boundary_target.shape[-2:]:
+        if loss_logits.shape[-2:] != core_target.shape[-2:]:
             loss_logits = F.interpolate(
                 loss_logits,
-                size=boundary_target.shape[-2:],
+                size=core_target.shape[-2:],
                 mode='bilinear',
                 align_corners=False)
 
-        positive = boundary_target.sum()
-        negative = boundary_target.numel() - positive
+        core_target = core_target.clamp_(0.0, 1.0)
+        band_target = torch.maximum(band_target.clamp_(0.0, 1.0), core_target)
+
+        positive = core_target.sum()
+        negative = core_target.numel() - positive
         pos_weight = (negative / positive.clamp_min(1.0)).clamp(
             min=1.0, max=self._ibd_max_pos_weight)
 
         with torch.amp.autocast(device_type=boundary_logits.device.type, enabled=False):
-            bce = F.binary_cross_entropy_with_logits(
+            core_bce = F.binary_cross_entropy_with_logits(
                 loss_logits.float(),
-                boundary_target.float(),
+                core_target.float(),
                 pos_weight=pos_weight.float(),
                 reduction='mean')
 
             boundary_prob = loss_logits.float().sigmoid()
-            intersection = (boundary_prob * boundary_target.float()).sum(dim=(1, 2, 3))
-            union = boundary_prob.sum(dim=(1, 2, 3)) + boundary_target.float().sum(dim=(1, 2, 3))
+            intersection = (boundary_prob * core_target.float()).sum(dim=(1, 2, 3))
+            union = boundary_prob.sum(dim=(1, 2, 3)) + core_target.float().sum(dim=(1, 2, 3))
             dice = 1.0 - (2.0 * intersection + 1.0) / (union + 1.0)
 
-        loss = self._ibd_bce_weight * bce + self._ibd_dice_weight * dice.mean()
+            band_violation = (boundary_prob * (1.0 - band_target.float())).mean()
+            far_neg_penalty = band_violation * self._ibd_far_neg_weight
+            band_recall_loss = (core_target.float() * (1.0 - boundary_prob) * band_target.float()).mean()
+
+        loss = (
+            self._ibd_bce_weight * core_bce +
+            self._ibd_dice_weight * dice.mean() +
+            self._ibd_band_loss_weight * band_recall_loss +
+            far_neg_penalty)
         return loss * self._ibd_loss_weight
 
     def get_auxiliary_losses(self) -> dict:
