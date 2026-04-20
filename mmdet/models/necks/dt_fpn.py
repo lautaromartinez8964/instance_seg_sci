@@ -15,9 +15,10 @@ from .fpn import FPN
 class DTFPN(FPN):
     """FPN with distance-transform-guided top-down fusion.
 
-    The deepest lateral feature predicts a normalized distance transform map.
-    During top-down fusion, each level uses the DT map to interpolate between
-    its local lateral feature and the upsampled deeper feature.
+    A shared high-resolution DT map is decoded from multi-scale lateral
+    features. During top-down fusion, each guided level resizes the shared DT
+    map and uses it to interpolate between its local lateral feature and the
+    upsampled deeper feature.
     """
 
     def __init__(self,
@@ -39,10 +40,21 @@ class DTFPN(FPN):
             raise ValueError(
                 f'guided_levels contains invalid indices: {invalid_levels}.')
 
-        self.dt_head = nn.Sequential(
-            nn.Conv2d(self.out_channels, dt_head_channels, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(dt_head_channels, 1, kernel_size=1))
+        self.dt_lateral_adapters = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(self.out_channels, dt_head_channels, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True))
+            for _ in range(self.backbone_end_level - self.start_level)
+        ])
+        self.dt_fuse_blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(dt_head_channels * 2, dt_head_channels, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(dt_head_channels, dt_head_channels, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True))
+            for _ in range(num_fusions)
+        ])
+        self.dt_predictor = nn.Conv2d(dt_head_channels, 1, kernel_size=1)
         self.gate_scales = nn.Parameter(torch.ones(num_fusions))
         self.gate_biases = nn.Parameter(torch.zeros(num_fusions))
         self._dt_loss_weight = float(max(dt_loss_weight, 0.0))
@@ -110,6 +122,18 @@ class DTFPN(FPN):
     def get_last_dt_map(self) -> Tensor | None:
         return self._last_dt_map
 
+    def _decode_shared_dt_map(self, laterals: List[Tensor]) -> Tensor:
+        dt_feat = self.dt_lateral_adapters[-1](laterals[-1])
+        for level in range(len(laterals) - 2, -1, -1):
+            dt_feat = F.interpolate(
+                dt_feat,
+                size=laterals[level].shape[2:],
+                mode='bilinear',
+                align_corners=False)
+            lateral_feat = self.dt_lateral_adapters[level](laterals[level])
+            dt_feat = self.dt_fuse_blocks[level](torch.cat([dt_feat, lateral_feat], dim=1))
+        return torch.sigmoid(self.dt_predictor(dt_feat))
+
     def forward(self, inputs) -> tuple:
         backbone_inputs = tuple(inputs)
         assert len(backbone_inputs) == len(self.in_channels)
@@ -119,7 +143,7 @@ class DTFPN(FPN):
             for i, lateral_conv in enumerate(self.lateral_convs)
         ]
 
-        dt_map = torch.sigmoid(self.dt_head(laterals[-1]))
+        dt_map = self._decode_shared_dt_map(laterals)
         self._last_dt_map = dt_map
         self._last_dt_loss = self._compute_dt_loss(dt_map)
 
