@@ -1,5 +1,5 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-from typing import List, Tuple
+from typing import List, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -8,33 +8,35 @@ from torch import Tensor
 
 from mmdet.registry import MODELS
 
-from .fpn import FPN
+from .cspnext_pafpn import CSPNeXtPAFPN
 
 
 @MODELS.register_module()
-class DTFPN(FPN):
-    """FPN with distance-transform-guided top-down fusion.
+class DTCSPNeXtPAFPN(CSPNeXtPAFPN):
+    """CSPNeXtPAFPN with distance-transform-guided top-down fusion.
 
-        Supports two DT prediction modes:
-
-        - ``shared``: decode one shared high-resolution DT map from multi-scale
-            laterals, then resize it for each guided fusion.
-        - ``per_level``: for each guided top-down fusion, predict a dedicated DT
-            map from the current lateral and the upsampled deeper feature.
-        - ``shared_refined``: keep the shared decoder as a global DT prior, then
-            refine a per-level DT map from the local lateral, the upsampled
-            deeper feature, and the resized shared DT prior.
+    This is the RTMDet-era counterpart of DTFPN v2. It keeps the original
+    CSPNeXtPAFPN topology, and only injects DT-guided gates into the top-down
+    route so the migration stays local and easy to ablate.
     """
 
     def __init__(self,
-                 *args,
+                 in_channels: Sequence[int],
                  guided_levels: List[int] | None = None,
                  dt_mode: str = 'shared',
-                 dt_head_channels: int = 128,
+                 dt_decoder_source: str = 'inputs',
+                 dt_head_channels: int = 64,
                  dt_loss_weight: float = 0.2,
+                 use_residual_fusion: bool = False,
+                 use_channel_attention: bool = False,
                  **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        num_fusions = self.backbone_end_level - self.start_level - 1
+        super().__init__(in_channels=in_channels, **kwargs)
+        # Keep backward compatibility with earlier config drafts. The current
+        # RTMDet DT neck only uses gated top-down fusion and ignores these
+        # legacy flags.
+        self.use_residual_fusion = use_residual_fusion
+        self.use_channel_attention = use_channel_attention
+        num_fusions = len(self.in_channels) - 1
         if guided_levels is None:
             guided_levels = list(range(num_fusions))
         self.guided_levels = sorted(set(guided_levels))
@@ -49,32 +51,35 @@ class DTFPN(FPN):
             raise ValueError(
                 f'Unsupported dt_mode={dt_mode}. Expected one of '
                 "{'shared', 'per_level', 'shared_refined'}.")
+        if dt_decoder_source not in {'inputs', 'topdown'}:
+            raise ValueError(
+                f'Unsupported dt_decoder_source={dt_decoder_source}. '
+                "Expected one of {'inputs', 'topdown'}.")
 
         self.dt_mode = dt_mode
+        self.dt_decoder_source = dt_decoder_source
+        if self.dt_decoder_source == 'inputs':
+            dt_decoder_in_channels = list(self.in_channels)
+        else:
+            # _build_dt_decoder_inputs() reuses the CSPNeXt top-down route, so
+            # its returned tuple channels become [c0] + in_channels[:-1].
+            dt_decoder_in_channels = [self.in_channels[0], *self.in_channels[:-1]]
+
         if self.dt_mode in {'shared', 'shared_refined'}:
             self.dt_lateral_adapters = nn.ModuleList([
                 nn.Sequential(
-                    nn.Conv2d(
-                        self.out_channels,
-                        dt_head_channels,
-                        kernel_size=3,
-                        padding=1),
+                    nn.Conv2d(channels, dt_head_channels, kernel_size=3,
+                              padding=1),
                     nn.ReLU(inplace=True))
-                for _ in range(self.backbone_end_level - self.start_level)
+                for channels in dt_decoder_in_channels
             ])
             self.dt_fuse_blocks = nn.ModuleList([
                 nn.Sequential(
-                    nn.Conv2d(
-                        dt_head_channels * 2,
-                        dt_head_channels,
-                        kernel_size=3,
-                        padding=1),
+                    nn.Conv2d(dt_head_channels * 2, dt_head_channels,
+                              kernel_size=3, padding=1),
                     nn.ReLU(inplace=True),
-                    nn.Conv2d(
-                        dt_head_channels,
-                        dt_head_channels,
-                        kernel_size=3,
-                        padding=1),
+                    nn.Conv2d(dt_head_channels, dt_head_channels,
+                              kernel_size=3, padding=1),
                     nn.ReLU(inplace=True))
                 for _ in range(num_fusions)
             ])
@@ -82,53 +87,50 @@ class DTFPN(FPN):
         if self.dt_mode == 'per_level':
             self.per_level_dt_heads = nn.ModuleList([
                 nn.Sequential(
-                    nn.Conv2d(
-                        self.out_channels * 2,
-                        dt_head_channels,
-                        kernel_size=3,
-                        padding=1),
+                    nn.Conv2d(self.in_channels[level] * 2, dt_head_channels,
+                              kernel_size=3, padding=1),
                     nn.ReLU(inplace=True),
                     nn.Conv2d(dt_head_channels, 1, kernel_size=1))
-                for _ in range(num_fusions)
+                for level in range(num_fusions)
             ])
         elif self.dt_mode == 'shared_refined':
             self.per_level_dt_heads = nn.ModuleList([
                 nn.Sequential(
-                    nn.Conv2d(
-                        self.out_channels * 2 + 1,
-                        dt_head_channels,
-                        kernel_size=3,
-                        padding=1),
+                    nn.Conv2d(self.in_channels[level] * 2 + 1,
+                              dt_head_channels,
+                              kernel_size=3,
+                              padding=1),
                     nn.ReLU(inplace=True),
-                    nn.Conv2d(
-                        dt_head_channels,
-                        dt_head_channels,
-                        kernel_size=3,
-                        padding=1),
+                    nn.Conv2d(dt_head_channels, dt_head_channels,
+                              kernel_size=3, padding=1),
                     nn.ReLU(inplace=True),
                     nn.Conv2d(dt_head_channels, 1, kernel_size=1))
-                for _ in range(num_fusions)
+                for level in range(num_fusions)
             ])
+
         self.gate_scales = nn.Parameter(torch.ones(num_fusions))
         self.gate_biases = nn.Parameter(torch.zeros(num_fusions))
         self._dt_loss_weight = float(max(dt_loss_weight, 0.0))
 
-        self._current_dt_target: torch.Tensor | None = None
+        self._current_dt_target: Tensor | None = None
         self._current_dt_valid_mask: Tensor | None = None
         self._last_dt_map: Tensor | None = None
         self._last_dt_maps: Tuple[Tensor, ...] = ()
         self._last_dt_loss: Tensor | None = None
         self.last_gates: Tuple[Tensor, ...] = ()
 
-    def _extract_dt_target(self, data_sample, device: torch.device) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    def _extract_dt_target(self, data_sample,
+                           device: torch.device) -> tuple[Tensor | None, Tensor | None]:
         if 'gt_sem_seg' not in data_sample:
             return None, None
-        dt_target = data_sample.gt_sem_seg.sem_seg.to(device=device, dtype=torch.float32)
+        dt_target = data_sample.gt_sem_seg.sem_seg.to(
+            device=device, dtype=torch.float32)
         if dt_target.ndim == 2:
             dt_target = dt_target.unsqueeze(0)
         elif dt_target.ndim == 4 and dt_target.shape[0] == 1:
             dt_target = dt_target.squeeze(0)
-        if dt_target.ndim == 3 and dt_target.shape[-1] == 1 and dt_target.shape[0] != 1:
+        if dt_target.ndim == 3 and dt_target.shape[-1] == 1 \
+                and dt_target.shape[0] != 1:
             dt_target = dt_target.permute(2, 0, 1).contiguous()
         dt_target = dt_target[:1]
         valid_mask = torch.ones_like(dt_target, dtype=torch.float32)
@@ -169,7 +171,8 @@ class DTFPN(FPN):
             targets.append(dt_target)
             valid_masks.append(valid_mask)
         self._current_dt_target = torch.stack(targets, dim=0) if targets else None
-        self._current_dt_valid_mask = torch.stack(valid_masks, dim=0) if valid_masks else None
+        self._current_dt_valid_mask = torch.stack(valid_masks, dim=0) \
+            if valid_masks else None
         self._last_dt_map = None
         self._last_dt_maps = ()
         self._last_dt_loss = None
@@ -182,7 +185,8 @@ class DTFPN(FPN):
         self._last_dt_loss = None
         self.last_gates = ()
 
-    def _compute_dt_loss(self, dt_maps: Tensor | Tuple[Tensor, ...]) -> Tensor | None:
+    def _compute_dt_loss(self,
+                         dt_maps: Tensor | Tuple[Tensor, ...]) -> Tensor | None:
         if self._current_dt_target is None or self._dt_loss_weight <= 0:
             return None
         if isinstance(dt_maps, Tensor):
@@ -209,14 +213,16 @@ class DTFPN(FPN):
                         valid_mask,
                         size=dt_map.shape[-2:],
                         mode='nearest')
-            with torch.amp.autocast(device_type=dt_map.device.type, enabled=False):
+            with torch.amp.autocast(device_type=dt_map.device.type,
+                                    enabled=False):
                 if valid_mask is not None:
                     squared_error = (dt_map.float() - dt_target.float())**2
                     valid_pixels = valid_mask.float() > 0.5
                     if valid_pixels.any():
                         loss_terms.append(squared_error[valid_pixels].mean())
                 else:
-                    loss_terms.append(F.mse_loss(dt_map.float(), dt_target.float()))
+                    loss_terms.append(F.mse_loss(dt_map.float(),
+                                                 dt_target.float()))
         return torch.stack(loss_terms).mean() * self._dt_loss_weight
 
     def get_auxiliary_losses(self) -> dict:
@@ -232,89 +238,111 @@ class DTFPN(FPN):
     def get_last_dt_maps(self) -> Tuple[Tensor, ...]:
         return self._last_dt_maps
 
-    def _decode_shared_dt_map(self, laterals: List[Tensor]) -> Tensor:
-        dt_feat = self.dt_lateral_adapters[-1](laterals[-1])
-        for level in range(len(laterals) - 2, -1, -1):
+    def _decode_shared_dt_map(self, inputs: Tuple[Tensor, ...]) -> Tensor:
+        dt_feat = self.dt_lateral_adapters[-1](inputs[-1])
+        for level in range(len(inputs) - 2, -1, -1):
             dt_feat = F.interpolate(
                 dt_feat,
-                size=laterals[level].shape[2:],
+                size=inputs[level].shape[2:],
                 mode='bilinear',
                 align_corners=False)
-            lateral_feat = self.dt_lateral_adapters[level](laterals[level])
-            dt_feat = self.dt_fuse_blocks[level](torch.cat([dt_feat, lateral_feat], dim=1))
+            lateral_feat = self.dt_lateral_adapters[level](inputs[level])
+            dt_feat = self.dt_fuse_blocks[level](
+                torch.cat([dt_feat, lateral_feat], dim=1))
         return torch.sigmoid(self.dt_predictor(dt_feat))
 
-    def _resize_dt_map(self, dt_map: Tensor, size: Tuple[int, int]) -> Tensor:
+    def _build_dt_decoder_inputs(self,
+                                 inputs: Tuple[Tensor, ...]) -> Tuple[Tensor, ...]:
+        if self.dt_decoder_source == 'inputs':
+            return inputs
+
+        inner_outs = [inputs[-1]]
+        for idx in range(len(self.in_channels) - 1, 0, -1):
+            feat_high = inner_outs[0]
+            feat_low = inputs[idx - 1]
+            feat_high = self.reduce_layers[len(self.in_channels) - 1 - idx](
+                feat_high)
+            inner_outs[0] = feat_high
+
+            upsample_feat = self.upsample(feat_high)
+            inner_out = self.top_down_blocks[len(self.in_channels) - 1 - idx](
+                torch.cat([upsample_feat, feat_low], 1))
+            inner_outs.insert(0, inner_out)
+
+        return tuple(inner_outs)
+
+    @staticmethod
+    def _resize_dt_map(dt_map: Tensor, size: Tuple[int, int]) -> Tensor:
         if dt_map.shape[2:] == size:
             return dt_map
         return F.interpolate(
-            dt_map,
-            size=size,
-            mode='bilinear',
-            align_corners=False)
+            dt_map, size=size, mode='bilinear', align_corners=False)
 
-    def forward(self, inputs) -> tuple:
-        backbone_inputs = tuple(inputs)
-        assert len(backbone_inputs) == len(self.in_channels)
-
-        laterals = [
-            lateral_conv(backbone_inputs[i + self.start_level])
-            for i, lateral_conv in enumerate(self.lateral_convs)
-        ]
+    def forward(self, inputs: Tuple[Tensor, ...]) -> Tuple[Tensor, ...]:
+        assert len(inputs) == len(self.in_channels)
 
         dt_map = None
         if self.dt_mode in {'shared', 'shared_refined'}:
-            dt_map = self._decode_shared_dt_map(laterals)
+            dt_map = self._decode_shared_dt_map(
+                self._build_dt_decoder_inputs(inputs))
 
-        used_backbone_levels = len(laterals)
+        inner_outs = [inputs[-1]]
         gate_records: List[Tensor] = []
         per_level_dt_maps: List[Tensor | None] = [None] * len(self.gate_scales)
-        for i in range(used_backbone_levels - 1, 0, -1):
-            target_level = i - 1
-            if 'scale_factor' in self.upsample_cfg:
-                upsampled = F.interpolate(laterals[i], **self.upsample_cfg)
-            else:
-                prev_shape = laterals[target_level].shape[2:]
-                upsampled = F.interpolate(
-                    laterals[i], size=prev_shape, **self.upsample_cfg)
 
+        for idx in range(len(self.in_channels) - 1, 0, -1):
+            fusion_idx = len(self.in_channels) - 1 - idx
+            feat_high = inner_outs[0]
+            feat_low = inputs[idx - 1]
+            feat_high = self.reduce_layers[fusion_idx](feat_high)
+            inner_outs[0] = feat_high
+
+            upsample_feat = self.upsample(feat_high)
+            guided_low = feat_low
+
+            target_level = idx - 1
             if target_level in self.guided_levels:
                 if self.dt_mode == 'shared':
                     assert dt_map is not None
                     resized_dt = self._resize_dt_map(
-                        dt_map, laterals[target_level].shape[2:])
+                        dt_map, feat_low.shape[2:])
                 elif self.dt_mode == 'per_level':
-                    route_feat = torch.cat(
-                        [laterals[target_level], upsampled], dim=1)
+                    route_feat = torch.cat([feat_low, upsample_feat], dim=1)
                     resized_dt = torch.sigmoid(
                         self.per_level_dt_heads[target_level](route_feat))
                     per_level_dt_maps[target_level] = resized_dt
                 else:
                     assert dt_map is not None
                     shared_resized_dt = self._resize_dt_map(
-                        dt_map, laterals[target_level].shape[2:])
+                        dt_map, feat_low.shape[2:])
                     route_feat = torch.cat([
-                        laterals[target_level],
-                        upsampled,
-                        shared_resized_dt.to(dtype=upsampled.dtype)
+                        feat_low, upsample_feat,
+                        shared_resized_dt.to(dtype=upsample_feat.dtype)
                     ], dim=1)
                     resized_dt = torch.sigmoid(
                         self.per_level_dt_heads[target_level](route_feat))
                     per_level_dt_maps[target_level] = resized_dt
-                scale = self.gate_scales[target_level].to(dtype=upsampled.dtype).view(1, 1, 1, 1)
-                bias = self.gate_biases[target_level].to(dtype=upsampled.dtype).view(1, 1, 1, 1)
-                gate = torch.sigmoid(scale * resized_dt.to(dtype=upsampled.dtype) + bias)
-                laterals[target_level] = (
-                    laterals[target_level] * (1.0 - gate) + upsampled * gate)
+
+                scale = self.gate_scales[target_level].to(
+                    dtype=upsample_feat.dtype).view(1, 1, 1, 1)
+                bias = self.gate_biases[target_level].to(
+                    dtype=upsample_feat.dtype).view(1, 1, 1, 1)
+                gate = torch.sigmoid(
+                    scale * resized_dt.to(dtype=upsample_feat.dtype) + bias)
+                guided_low = feat_low * (1.0 - gate) + upsample_feat * gate
                 gate_records.insert(0, gate.detach())
-            else:
-                laterals[target_level] = laterals[target_level] + upsampled
+
+            inner_out = self.top_down_blocks[fusion_idx](
+                torch.cat([upsample_feat, guided_low], 1))
+            inner_outs.insert(0, inner_out)
 
         self.last_gates = tuple(gate_records)
+
         if self.dt_mode == 'shared':
             self._last_dt_map = dt_map
             self._last_dt_maps = ()
-            self._last_dt_loss = self._compute_dt_loss(dt_map) if dt_map is not None else None
+            self._last_dt_loss = self._compute_dt_loss(dt_map) \
+                if dt_map is not None else None
         elif self.dt_mode == 'per_level':
             ordered_dt_maps = tuple(
                 per_level_dt_maps[level] for level in self.guided_levels
@@ -329,35 +357,26 @@ class DTFPN(FPN):
             self._last_dt_map = dt_map
             self._last_dt_maps = ordered_dt_maps
             loss_terms = []
-            shared_loss = self._compute_dt_loss(dt_map) if dt_map is not None else None
+            shared_loss = self._compute_dt_loss(dt_map) \
+                if dt_map is not None else None
             refined_loss = self._compute_dt_loss(ordered_dt_maps)
             if shared_loss is not None:
                 loss_terms.append(shared_loss)
             if refined_loss is not None:
                 loss_terms.append(refined_loss)
-            self._last_dt_loss = torch.stack(loss_terms).mean() if loss_terms else None
+            self._last_dt_loss = torch.stack(loss_terms).mean() \
+                if loss_terms else None
 
-        outs = [
-            self.fpn_convs[i](laterals[i]) for i in range(used_backbone_levels)
-        ]
+        outs = [inner_outs[0]]
+        for idx in range(len(self.in_channels) - 1):
+            feat_low = outs[-1]
+            feat_high = inner_outs[idx + 1]
+            downsample_feat = self.downsamples[idx](feat_low)
+            out = self.bottom_up_blocks[idx](
+                torch.cat([downsample_feat, feat_high], 1))
+            outs.append(out)
 
-        if self.num_outs > len(outs):
-            if not self.add_extra_convs:
-                for _ in range(self.num_outs - used_backbone_levels):
-                    outs.append(F.max_pool2d(outs[-1], 1, stride=2))
-            else:
-                if self.add_extra_convs == 'on_input':
-                    extra_source = backbone_inputs[self.backbone_end_level - 1]
-                elif self.add_extra_convs == 'on_lateral':
-                    extra_source = laterals[-1]
-                elif self.add_extra_convs == 'on_output':
-                    extra_source = outs[-1]
-                else:
-                    raise NotImplementedError
-                outs.append(self.fpn_convs[used_backbone_levels](extra_source))
-                for i in range(used_backbone_levels + 1, self.num_outs):
-                    if self.relu_before_extra_convs:
-                        outs.append(self.fpn_convs[i](F.relu(outs[-1])))
-                    else:
-                        outs.append(self.fpn_convs[i](outs[-1]))
+        for idx, conv in enumerate(self.out_convs):
+            outs[idx] = conv(outs[idx])
+
         return tuple(outs)

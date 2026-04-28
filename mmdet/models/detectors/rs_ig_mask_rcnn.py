@@ -31,7 +31,9 @@ class RSMaskRCNN(MaskRCNN):
                                     batch_data_samples: SampleList) -> None:
         if hasattr(self, 'neck') and hasattr(self.neck, 'set_auxiliary_targets'):
             self.neck.set_auxiliary_targets(
-                batch_data_samples, device=batch_inputs.device)
+                batch_data_samples,
+                input_shape=batch_inputs.shape[-2:],
+                device=batch_inputs.device)
 
     def _get_neck_auxiliary_losses(self) -> dict:
         if hasattr(self, 'neck') and hasattr(self.neck, 'get_auxiliary_losses'):

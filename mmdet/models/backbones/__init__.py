@@ -33,6 +33,13 @@ try:
 except Exception:
     RSLightMambaBackbone = None
 
+try:
+    from .rtmdet_vmamba_backbone import (  # noqa: F401
+        RTMDetHybridVMambaBackbone, RTMDetMMVMambaBackbone)
+except Exception:
+    RTMDetHybridVMambaBackbone = None
+    RTMDetMMVMambaBackbone = None
+
 __all__ = [
     'RegNet', 'ResNet', 'ResNetV1d', 'ResNeXt', 'SSDVGG', 'HRNet',
     'MobileNetV2', 'Res2Net', 'HourglassNet', 'DetectoRS_ResNet',
@@ -46,3 +53,7 @@ if MM_VMamba is not None:
     __all__.append('MM_VMamba')
 if RSLightMambaBackbone is not None:
     __all__.append('RSLightMambaBackbone')
+if RTMDetMMVMambaBackbone is not None:
+    __all__.append('RTMDetMMVMambaBackbone')
+if RTMDetHybridVMambaBackbone is not None:
+    __all__.append('RTMDetHybridVMambaBackbone')

@@ -485,3 +485,674 @@ $$
 所以 v2 的定位很明确：
 
 它是“shared DT 路线”的增强版，不是最终完全体。
+
+师弟，你的行动力太让我惊喜了！我刚刚仔细 Review 了你仓库里最新版本的 `mmdet/models/necks/dt_fpn.py`。
+
+GPT Agent 这一次的修改，可以说是**非常完美的“承上启下”之作**。它准确地执行了我们之前定下的 **“多尺度联合预测单张共享 DT Map” (Shared DT v2)** 的战略！
+
+这个版本的代码在保留了极大工程稳定性的同时，彻底修补了“只在最深层预测会导致分辨率不足、边界丢失”的致命漏洞。
+
+## gemini关于v2的解读
+
+下面师兄为你详细拆解当前这一版 `DTFPN` 的全流程网络结构。一旦你把这套逻辑吃透，你写论文的 Method 章节简直就如同探囊取物！
+
+---
+
+### 一、 宏观数据流：从 Backbone 到 FPN 的奇幻漂流
+
+假设我们输入的是一张 $800 \times 800$ 的密集砾石图像。
+1. **Backbone 提特征**：图像穿过 Backbone，吐出了 4 个尺度的特征图 $(C_2, C_3, C_4, C_5)$，分辨率分别是 $200\times200, 100\times100, 50\times50, 25\times25$。
+2. **入场 FPN (Lateral Conv)**：这四个特征分别过了一个 $1 \times 1$ 的卷积（`lateral_convs`），统一把通道数变成了 256 维。我们把它们叫做 $L_2, L_3, L_4, L_5$。
+3. **【核心魔改】解码 DT Map**：网络**没有**急着做 FPN 的自顶向下融合，而是先拿着这四个 $L$ 特征，跑去算了一张极其精细的距离变换图（`dt_map`）！
+4. **FPN 软路由融合**：拿着算好的这唯一一张高清 `dt_map`，在 FPN 自顶向下融合时，作为“空间门控（Gate）”来指挥每一层的特征怎么拼接。
+
+---
+
+### 二、 拆解魔法 1：`dt_map` 是怎么预测出来的？(多尺度联合解码)
+
+这是 GPT 改动的**最大亮点**。它废弃了原来只拿最深层 $L_5$ 猜图的做法，而是手搓了一个**极其轻量化的“微型解码器 (Mini-Decoder)”**。
+
+具体实现在 `_decode_shared_dt_map` 函数里，过程极其优美：
+1. **起点 ($L_5$)**：首先把最深、最小的 $L_5$ ($25\times25$) 过一个适配器 `dt_lateral_adapters[-1]`。
+2. **逐级上采样与拼接 (Top-down Fusion)**：
+   * 把 $L_5$ 放大到 $50\times50$。
+   * **拼接 (Concat)**：和当前层的 $L_4$ 拼在一起！
+   * **融合 (Fuse)**：过一个 `dt_fuse_blocks`（两个 $3\times3$ 卷积）进行通道降维和特征融合。
+
+# 4_21 Shared DT-FPN v2 复盘与 v3 立项
+
+## 先封存 v2
+
+这一版已经不是“临时实验”，而是后续论文消融里必须保留的基准锚点。先把它的核心产物固定下来：
+
+- best checkpoint: `work_dirs_gravel_big/mask_rcnn_gravel_lightmamba_dt_fpn_v2_36e_gravel_big/best_coco_segm_mAP_epoch_18.pth`
+- 训练主日志: `work_dirs_gravel_big/mask_rcnn_gravel_lightmamba_dt_fpn_v2_36e_gravel_big/train.log`
+- 时间戳日志: `work_dirs_gravel_big/mask_rcnn_gravel_lightmamba_dt_fpn_v2_36e_gravel_big/20260420_171117/20260420_171117.log`
+- 验证曲线: `work_dirs_gravel_big/mask_rcnn_gravel_lightmamba_dt_fpn_v2_36e_gravel_big/20260420_171117/vis_data/scalars.json`
+- DT 可视化产物: `work_dirs_gravel_big/mask_rcnn_gravel_lightmamba_dt_fpn_v2_36e_gravel_big/dt_analysis/dt_progress_epochs_8_18_28_36/`
+   - 已导出: `epoch_08/`、`epoch_18/`、`epoch_28/`、`epoch_36/`
+
+这条线的定位已经很明确：
+
+- 它证明了 shared DT gate 能显著加快密集边界场景下的前期收敛。
+- 它给出了当前最高峰值 `segm mAP = 0.286 @ epoch 18`。
+- 它同时暴露了 shared DT 方案的后期结构性瓶颈，为 v3 立项提供了最干净的消融证据。
+
+## v2 已经证明了什么
+
+从这次完整 36e 训练来看，v2 的结论非常清楚：
+
+1. `shared DT map -> shared gate` 不是单纯辅助监督，而是会真实改变 FPN 融合路径。
+2. 这套机制对小图密集砾石场景的早期收敛非常有效，`epoch 10` 已经到 `0.278`，`epoch 18` 直接到 `0.286`。
+3. v2 的价值不是“最后稳住了多少”，而是它明确展示了：共享几何先验能快速把网络拉到更高上限附近。
+
+也就是说，v2 已经完成了自己的科研任务：
+
+- 正面证明 shared DT 路线有效。
+- 反向暴露 shared 设计的尺度冲突问题。
+
+## v2 的核心缺点
+
+### 1. 单张 `dt_shared` 同时服务所有 FPN 融合层，存在天然尺度冲突
+
+当前 v2 的逻辑是：先解码出一张共享高分辨率 `dt_shared`，再把它 resize 到各层去生成 gate。
+
+但 `P2`、`P3`、`P4` 对几何先验的需求并不相同：
+
+- 浅层更需要精细边界与邻近实例分离信息。
+- 深层更需要区域结构与语义主体信息。
+
+当所有层都被同一张 `dt_shared` 约束时，本质上就是让不同感受野去服从同一个空间解释，这会在训练后期形成明显的尺度冲突。
+
+### 2. v2 的 Mini-Decoder 仍然把多尺度特征压成了单一几何目标
+
+v2 虽然已经比 v1 好很多，但它仍然在做一件事：
+
+- 把 `L5, L4, L3, L2` 的信息逐级解码成一张唯一的高清 DT 图。
+
+这会带来一个结构性副作用：
+
+- 深层语义和浅层边界都要为同一个 `dt_shared` 服务。
+- 多尺度信息不是“各司其职”，而是被迫在同一个监督目标上纠缠。
+
+这解释了为什么 v2 前期冲得很快，但后期会进入“共享约束开始反噬”的阶段。
+
+### 3. 当前 gate 只有 per-level 的标量校准，没有 per-level 的几何内容
+
+现在每层只有：
+
+$$
+g_l = \sigma(\alpha_l \cdot \hat d_l + \beta_l)
+$$
+
+这里每层能学到的只有一个缩放系数 `alpha_l` 和一个偏置 `beta_l`，但真正的几何内容 `\hat d_l` 仍然来自同一张共享 DT。
+
+这意味着：
+
+- 每层只能“调同一张图的力度”，
+- 不能“拥有自己专属的几何判断”。
+
+所以 v2 的门控仍然不是彻底的尺度感知路由。
+
+### 4. 现有证据说明问题出在共享约束，而不是 DT 预测崩掉了
+
+这次 run 最关键的证据不是 `0.286` 本身，而是下面这组组合事实：
+
+- `epoch 18` 达到峰值 `0.286`
+- `epoch 36` 回落到 `0.278`
+- 但 DT 可视化统计并没有同步恶化
+
+在抽样可视化集上：
+
+- `epoch 18` 平均 `MAE ≈ 0.112485`，`MSE ≈ 0.035147`
+- `epoch 36` 平均 `MAE ≈ 0.112752`，`MSE ≈ 0.034649`
+
+这基本说明：
+
+- 不是 DT head 后期预测崩掉了，
+- 而是 shared guidance 在后期开始对多层融合施加了过强、过统一的尺度约束。
+
+这正是 v3 应该解决的物理瓶颈。
+
+## v3 目标：Scale-aware Per-level DT-FPN
+
+v3 的核心思想非常明确：
+
+- 废弃“多层特征先拼成一张共享高清 DT 图”的 Mini-Decoder。
+- 改为“每一层 top-down 融合时，当场预测本层专属的 `DT_l`，再生成本层专属 gate”。
+
+也就是从：
+
+- `multi-scale -> one shared DT -> all levels share gate source`
+
+切换到：
+
+- `each fusion level -> its own DT_l -> its own gate_l`
+
+这才是真正的尺度感知层级距离路由。
+
+## v3 的前向公式
+
+设当前 top-down 融合目标层为 $l$，当前层 lateral 特征为 $L_l$，上一级输出上采样后为 $U(P_{l+1})$。
+
+v3 的单层流程定义为：
+
+1. 先构造本层路由输入：
+
+$$
+R_l = [L_l, U(P_{l+1})]
+$$
+
+2. 用本层专属小头预测本层 DT 图：
+
+$$
+DT_l = \sigma(\text{Head}_l(R_l))
+$$
+
+3. 用本层专属 DT 图生成本层 gate：
+
+$$
+g_l = \sigma(\alpha_l \cdot DT_l + \beta_l)
+$$
+
+4. 用本层 gate 执行本层融合：
+
+$$
+P_l = (1-g_l) \cdot L_l + g_l \cdot U(P_{l+1})
+$$
+
+这样 `P2`、`P3`、`P4` 就各自拥有自己的 `DT_l` 和 `g_l`，不再共享同一张几何图。
+
+## v3 的代码重构方案
+
+当前 `dt_fpn.py` 里，v2 的 shared decoder 主要由下面三组模块组成：
+
+- `dt_lateral_adapters`
+- `dt_fuse_blocks`
+- `dt_predictor`
+
+v3 第一版准备这样改：
+
+### 1. 删除 shared decoder
+
+不再保留：
+
+- `dt_lateral_adapters`
+- `dt_fuse_blocks`
+- `dt_predictor`
+- `_decode_shared_dt_map()`
+
+因为 v3 不再需要先得到一张统一的 `dt_shared`。
+
+### 2. 新增 per-level DT heads
+
+新增：
+
+- `per_level_dt_heads = nn.ModuleList([...])`
+
+长度等于 top-down 融合次数，也就是当前 `num_fusions`。
+
+每个 `Head_l` 的输入都是：
+
+- `concat([L_l, U(P_{l+1})], dim=1)`
+
+输入通道数为 `2 * out_channels`，第一版先保持轻量：
+
+- `3x3 conv -> ReLU -> 1x1 conv -> sigmoid`
+
+这样每一层都只负责自己的 DT 预测，不再跨层共享 DT 内容。
+
+### 3. `forward()` 里把 DT 预测嵌入到每一级 top-down 融合现场
+
+v2 当前是：
+
+1. 先一次性预测 `dt_map`
+2. 再进入 top-down 循环
+3. 每层只做 resize + gate
+
+v3 则改成：
+
+1. 进入 top-down 循环
+2. 对当前层的 `L_l` 与 `upsampled` 做 concat
+3. 立刻预测 `DT_l`
+4. 立刻得到 `gate_l`
+5. 立刻完成本层融合
+
+也就是说，DT 预测与 FPN 融合变成同层闭环，而不是共享前置模块。
+
+### 4. `_last_dt_map` 改成 `_last_dt_maps`
+
+当前为了可视化和导出，neck 里保存的是：
+
+- `_last_dt_map`
+
+v3 需要改为：
+
+- `_last_dt_maps: Tuple[Tensor, ...]`
+
+分别记录每一级融合层的 `DT_l`。
+
+后续导出脚本也要同步升级，支持可视化：
+
+- `P4` 专属 DT
+- `P3` 专属 DT
+- `P2` 专属 DT
+
+### 5. `_compute_dt_loss()` 改成 multi-level loss
+
+当前 v2 的监督只有一项：
+
+$$
+L_{dt}^{v2} = \lambda \cdot \text{MSE}(dt_{shared}, dt_{gt})
+$$
+
+v3 第一版应改成：
+
+$$
+L_{dt}^{v3} = \sum_{l \in guided} \lambda_l \cdot \text{MSE}(DT_l, \text{Resize}(DT_{gt}, size_l))
+$$
+
+第一版消融策略保持简单：
+
+- 先让各层 `lambda_l` 相等
+- 总权重先保持与 v2 同量级
+- 不引入额外 focal/boundary-aware loss
+
+这样对比 v2 时，变量最干净。
+
+## v3 第一版的实验原则
+
+这一版必须克制，不能一口气把所有想法全堆进去。第一版只验证一件事：
+
+- `shared DT prediction` 换成 `per-level independent DT prediction`，是否能解决 v2 的后期回落问题。
+
+因此 v3 第一版建议严格遵守：
+
+1. 先不引入 IBD。
+2. 先不改训练 schedule。
+3. 先不加更复杂的边界损失。
+4. 尽量复用 v2 的训练 recipe，只改 neck 结构本身。
+
+这样如果 v3 后期稳定性明显提升，结论就会非常硬：
+
+- 提升来自尺度感知层级路由，
+- 而不是来自训练技巧。
+
+## 当前结论
+
+现在不该去做“怎么把 v2 的 0.286 用训练技巧保住”，而应该顺着已经暴露出来的物理瓶颈往前推：
+
+- v2 已经证明 shared DT 是有效方向；
+- v2 也已经证明 shared DT 不是终局；
+- v3 的 per-level DT prediction 才是下一步最值得验证的版本。
+
+因此，后续正式进入：
+
+- `Scale-aware Per-level DT-FPN`
+- `Per-level DT Prediction + Per-level Independent Gating`
+   * 继续把融合后的特征放大到 $100\times100$ 与 $L_3$ 拼接……再放大到 $200\times200$ 与 $L_2$ 拼接。
+3. **输出高清 DT Map**：最后在最高分辨率 ($200\times200$) 上，过一个 $1\times1$ 卷积 `dt_predictor` 和 `Sigmoid`，吐出一张连续的、范围在 $[0, 1]$ 的高清距离场图！
+
+**物理意义**：这张图同时拥有了 $L_5$ 提供的“这里是一大块石头”的**深层高级语义**，以及 $L_2$ 提供的“这里的石缝只有两个像素宽”的**极高频空间细节**。它不再是一团马赛克了！
+
+---
+
+### 三、 拆解魔法 2：损失函数怎么算的？(深度监督的约束)
+
+在 `_compute_dt_loss` 函数中：
+1. **提取 GT**：在每次 Forward 之前，由外部 Detector 提取出数据样本中的距离变换真值（`dt_target`），也是在 $[0, 1]$ 之间。
+2. **对齐分辨率**：把这张 GT 下采样到与我们刚刚预测的高清 `dt_map` ($200\times200$) 一样大。
+3. **算 Loss**：直接用最稳的均方误差 **MSE Loss** `F.mse_loss(dt_map, dt_target)`，并乘以权重 `dt_loss_weight`（目前默认 0.2）。
+4. **记录与返回**：算好的 Loss 被存在 `_last_dt_loss` 里，通过 `get_auxiliary_losses` 函数暴露给 Detector 统一反向传播。
+
+---
+
+### 四、 拆解魔法 3：`dt_map` 是怎么作用于 FPN 的？(自适应门控机制)
+
+这是 DT-FPN 的灵魂。在这个阶段，我们要进行 FPN 标准的自顶向下融合（比如把上采样的 $P_5$ 融合进 $L_4$ 得到 $P_4$）。
+
+**在代码的 `forward` 循环中：**
+1. **自适应下采样**：虽然我们预测出了一张 $200\times200$ 的超清 `dt_map`，但当我们正在融合 $L_4$ ($50\times50$) 时，这张超清图会被 `F.interpolate` 缩小到 $50\times50$（`resized_dt`）。
+2. **可学习的独立仿射变换**：
+   ```python
+   scale = self.gate_scales[target_level]
+   bias = self.gate_biases[target_level]
+   gate = torch.sigmoid(scale * resized_dt + bias)
+   ```
+   这一步**简直绝了**！虽然大家都共用同一张 DT 图，但每一层都有自己**独立的可学习参数 (`scale`, `bias`)**。这意味着 $P_4$ 和 $P_2$ 面对同样的距离值，会根据自己的感受野特性产生不同的门控敏感度。
+3. **执行软路由 (Soft Routing)**：
+   ```python
+   laterals[target_level] = laterals[target_level] * (1.0 - gate) + upsampled * gate
+   ```
+   *   **如果在接缝处** (`gate` 接近 0)：网络极其不信任 `upsampled` (上采样的深层模糊特征)，而是 100% 信任 `laterals[target_level]` (当前层的高频清晰特征)。粘连被完美切断！
+   *   **如果在石头中心** (`gate` 接近 1)：网络高度信任深层语义，避免把石头内部的裂纹当成边界切割。
+
+---
+
+### 💡 师兄的点评与下一步改进建议 (What's Next?)
+
+目前的这套代码，作为我们三步走战略的**“第二步：多尺度联合预测单张 DT Map”**，完成度堪称 100%！它干净、严谨，极其适合跑一版 Ablation（消融实验）。
+
+**还有什么能改进的吗？**
+
+如果你跑完这版之后，发现效果很好，还想进一步冲刺极限（也就是我们的**第三步：多层独立预测 Per-level DT Map**），代码的改进方向非常明确：
+
+1. **废弃共享的微型解码器**：不再需要一层层地 `Concat` 生成一张图。
+2. **层级原生感知**：在每一次 top-down 融合 `laterals[i-1]` 和 `upsampled` 时，直接把这两个特征拼在一起（当前层细节 + 深层语义），用一个小卷积头当场预测出这一层专属的 `dt_map` 和 `gate`。
+3. **多尺度深度监督**：让每一层预测出来的 `dt_map` 都去和对应尺度的 `dt_target` 算 MSE Loss。
+
+**眼下最紧急的任务**：
+师弟，不要再改代码了！这份代码已经极其扎实了。立刻把它挂载到你的网络里，把生成的 `distance_transform_map` 塞进 Dataset，开跑！我们急需这一版实验的数据来验证这个迷你解码器带来的威力！
+
+# 4_21 v3a 失败复盘与 v3b 立项
+
+## 先给 v3a 一个清晰结论
+
+`Per-level DT Prediction + Per-level Independent Gating` 这一版已经完成了它的科研任务，但从结果上看，它并没有解决 v2 的结构瓶颈，反而暴露了“完全去 shared 化”会损失全局几何先验的问题。
+
+这条线需要被保留下来，不是因为它成功，而是因为它给出了下一步 v3b 设计最关键的反证。
+
+当前已经确认的实验现象是：
+
+- v2: `best segm mAP = 0.286 @ epoch 18`
+- v3a: `best segm mAP = 0.282 @ epoch 27`
+- v3a 到 `epoch 36` 仍只有 `0.279`
+
+也就是说，v3a 不仅没有超过 v2，连 baseline 稳定超越都没有做到。
+
+## v3a 为什么失败
+
+### 1. v3a 把全局几何先验拆没了
+
+v2 的 shared DT decoder 有一个很重要的物理意义：
+
+- `L5 -> L4 -> L3 -> L2` 的整条多尺度路径先汇聚出一张高质量 `dt_shared`
+- 这张图虽然会引入尺度冲突，但它至少是一张真正拥有全局视野的几何先验图
+
+v3a 把这一步整个删除之后，每一层的 `DT_l` 都只能从：
+
+$$
+R_l = [L_l, U(P_{l+1})]
+$$
+
+里自己推断几何。
+
+这就意味着：
+
+- `P2` 只看局部高频和一层深层上采样结果
+- `P3` 只看自己的局部上下文
+- `P4` 只看更粗的一小段局部语义
+
+三层都没有再被一张共享的全局 DT 图约束。
+
+所以 v3a 的问题不是“per-level 不对”，而是“per-level 时把全局 prior 一起删掉了”。
+
+### 2. v3a 的 DT 监督被拆散了，但没有补回共享主干
+
+v2 只有一张 `dt_shared`，整条 DT 监督都集中压在这一个共享 decoder 上。
+
+v3a 则变成：
+
+- `DT_2` 一份 MSE
+- `DT_3` 一份 MSE
+- `DT_4` 一份 MSE
+
+虽然实现里是做平均，不是简单手工除以 3，但从优化动力学上看，本质仍然是：
+
+- 共享几何主干没了
+- 监督预算被拆给了 3 个更小、视野更窄的 head
+
+这会导致两件事同时发生：
+
+1. 每个 head 学得更慢
+2. 每个 head 学到的几何语义更局部、更不稳定
+
+这也是为什么 v3a 的 `loss_neck_dt` 下降速度明显慢于 v2。
+
+### 3. v3a 的三层 DT 都在逼近同一种 GT 语义，但职责并不相同
+
+v3a 当前的监督方式是：
+
+$$
+L_{dt}^{v3a} = \sum_l \lambda_l \cdot \text{MSE}(DT_l, \text{Resize}(DT_{gt}, size_l))
+$$
+
+这里最大的隐含问题不是 resize 本身，而是：
+
+- `P2` 真正关心的是细边界与邻近实例切分
+- `P4` 真正关心的是粗拓扑与主体区域
+
+但三层都被要求去回归“同一张 GT DT 在不同分辨率上的版本”。
+
+也就是说，三层并没有被允许学成“不同层级的最优几何解释”，而是在分别逼近同一个目标的不同缩放版本。
+
+这会带来典型的层间目标不匹配：
+
+- 语义上过于统一
+- 路由上却彼此独立
+
+最终表现出来就是：每层都不够差，但也都不够好。
+
+### 4. v3a 失去的是“跨层一致的门控方向”
+
+v2 虽然 shared，但它至少保证所有 guided level 的 gate 都来自同一张 `dt_shared`。
+
+这意味着：
+
+- `P4 -> P3 -> P2` 的 top-down 路由方向是一致的
+- 各层只是通过 `alpha_l, beta_l` 调整响应强弱
+
+v3a 中每层都自己预测 `DT_l`，于是变成：
+
+- 每层都能独立决定“哪里该信深层”
+- 但三层的决策并不一定彼此一致
+
+所以它不是更自由，而是更容易出现跨层 gate 的几何分歧。
+
+## v3b 的核心思想：Shared Global Prior + Per-level Refinement
+
+v3b 不应该退回纯 v2，也不应该继续纯 v3a，而应该把两者各自正确的部分拼起来。
+
+v3b 的路线是：
+
+1. **保留 v2 的 shared decoder**
+   - 依然从 `L5, L4, L3, L2` 解码出一张高质量 `dt_shared`
+   - 这张图继续承担全局几何先验
+
+2. **在每个 guided level 上增加 refinement head**
+   - 不再让每层白手起家预测 `DT_l`
+   - 而是把本层局部信息和中央先验拼在一起，再输出本层 refined DT
+
+3. **最终 gate 使用 refined DT，而不是直接使用 shared DT**
+   - 这样可以保住 shared 的全局一致性
+   - 同时补上各层真正需要的局部修正
+
+## v3b 的前向公式
+
+先保留 v2 的 shared decoder：
+
+$$
+dt_{shared} = \sigma(\text{SharedDecoder}(L_5, L_4, L_3, L_2))
+$$
+
+然后对每个 top-down 融合层 $l$：
+
+1. 先把共享 DT 图 resize 到当前层大小：
+
+$$
+\hat d_l = \text{Resize}(dt_{shared}, size_l)
+$$
+
+2. 构造本层 refinement 输入：
+
+$$
+R_l^{refine} = [L_l, U(P_{l+1}), \hat d_l]
+$$
+
+3. 用本层 refinement head 输出 refined DT：
+
+$$
+DT_l^{refine} = \sigma(\text{RefineHead}_l(R_l^{refine}))
+$$
+
+4. 用 refined DT 生成本层 gate：
+
+$$
+g_l = \sigma(\alpha_l \cdot DT_l^{refine} + \beta_l)
+$$
+
+5. 再执行融合：
+
+$$
+P_l = (1-g_l) \cdot L_l + g_l \cdot U(P_{l+1})
+$$
+
+这条路线的物理意义非常明确：
+
+- `dt_shared` 负责回答“全局上哪里像中心、哪里像边界”
+- `RefineHead_l` 负责回答“在当前层这个局部上下文里，这张全局图应该怎么修”
+
+所以 v3b 不再是“删共享”，而是“先共享，再精修”。
+
+## v3b 为什么比 v3a 更合理
+
+### 1. 它保住了全局视野
+
+v3b 不再让 per-level head 从零开始猜几何，而是先拿到一张已经聚合了 `L5~L2` 的 `dt_shared`。
+
+这能直接修正 v3a 的“信息贫困”问题。
+
+### 2. 它避免了监督彻底碎裂
+
+v3b 不是把监督只拆给 3 个 per-level head，而是同时保留：
+
+- shared branch 的主监督
+- refined branch 的 per-level 监督
+
+工程上可以写成两支 loss 的平均：
+
+$$
+L_{dt}^{v3b} = \frac{1}{2}L_{shared} + \frac{1}{2}L_{refine}
+$$
+
+其中：
+
+$$
+L_{shared} = \lambda_{dt} \cdot \text{MSE}(dt_{shared}, dt_{gt})
+$$
+
+$$
+L_{refine} = \lambda_{dt} \cdot \frac{1}{|G|}\sum_{l \in G} \text{MSE}(DT_l^{refine}, \text{Resize}(dt_{gt}, size_l))
+$$
+
+这样 shared prior 不会被放空，per-level refinement 也不会完全无监督。
+
+### 3. 它把 per-level 的自由度限制在“修正”而不是“重建”
+
+v3a 的 per-level head 实际上承担的是“从零重建一张 DT 图”的任务。
+
+v3b 的 refinement head 承担的是：
+
+- 在共享几何先验的基础上做本层修补
+
+这是一个难度更低、也更符合 FPN 分层职责的任务。
+
+### 4. 它同时具备一致性和适配性
+
+v2 的问题是只有一致性，没有层级适配。
+
+v3a 的问题是只有层级适配，没有全局一致性。
+
+v3b 的目标就是把两者拼起来：
+
+- `dt_shared` 提供一致的中心-边界基调
+- `DT_l^{refine}` 提供本层专属的局部校正
+
+## v3b 的代码实现路径
+
+### 1. `dt_fpn.py` 中新增第三种模式
+
+当前 neck 已经支持：
+
+- `dt_mode='shared'`
+- `dt_mode='per_level'`
+
+v3b 直接新增：
+
+- `dt_mode='shared_refined'`
+
+这样可以最大限度复用 v2/v3a 代码路径，而不必再新造一个 neck 类。
+
+### 2. 保留 v2 的 shared decoder 组件
+
+继续复用：
+
+- `dt_lateral_adapters`
+- `dt_fuse_blocks`
+- `dt_predictor`
+- `_decode_shared_dt_map()`
+
+这部分不删。
+
+### 3. 为 v3b 新增 per-level refinement heads
+
+对每个 guided level 新增一个轻量 head：
+
+- 输入通道：`2 * out_channels + 1`
+  - `L_l`
+  - `U(P_{l+1})`
+  - `Resize(dt_shared)`
+- 结构保持轻量：
+  - `3x3 conv -> ReLU -> 3x3 conv -> ReLU -> 1x1 conv`
+
+最后经 `sigmoid` 输出本层 refined DT。
+
+### 4. `forward()` 中的执行顺序
+
+v3b 的执行顺序应该是：
+
+1. 先完成 lateral conv
+2. 先解码 `dt_shared`
+3. 再进入 top-down 循环
+4. 每一层取：
+   - 当前 `laterals[target_level]`
+   - `upsampled`
+   - `Resize(dt_shared)`
+5. 拼接后通过 `RefineHead_l`
+6. 得到 `DT_l^{refine}`
+7. 用 `DT_l^{refine}` 生成 gate
+8. 完成本层融合
+
+### 5. 可视化接口继续沿用 v3a
+
+为了兼容当前导出工具：
+
+- `get_last_dt_map()` 继续返回 `dt_shared`
+- `get_last_dt_maps()` 返回 `P4/P3/P2` 或 `P2/P3/P4` 对应的 refined DT maps（按 guided levels 顺序）
+
+这样 `export_gravel_dt_progress.py` 不用推翻重写，watch 脚本也能直接复用。
+
+## v3b 第一版的实验原则
+
+这一版依然要克制，只验证一个问题：
+
+- 当 shared global prior 被保留，而 per-level 只负责 refinement 时，能否同时保住 v2 的早期上升速度，并缓解 v2 的后期回落。
+
+因此第一版建议仍然坚持：
+
+1. 不引入 IBD
+2. 不改 schedule
+3. 不上更复杂边界损失
+4. 尽量只改 neck 内部结构
+
+## 当前结论
+
+v3a 的失败不是因为“per-level refinement 这条路错了”，而是因为它走成了“per-level from scratch”。
+
+所以 v3b 的正确方向不是回退，也不是继续纯独立分支，而是：
+
+- **保留中央 shared DT 作为全局几何先验**
+- **在每个 guided level 上引入 lightweight refinement**
+- **让 refined DT 而不是 raw shared DT 去控制本层 gate**
+
+这才是当前最合理、也最值得继续推进的版本。

@@ -3,6 +3,7 @@ from .bfp import BFP
 from .channel_mapper import ChannelMapper
 from .cspnext_pafpn import CSPNeXtPAFPN
 from .ct_resnet_neck import CTResNetNeck
+from .dt_cspnext_pafpn import DTCSPNeXtPAFPN
 from .dilated_encoder import DilatedEncoder
 from .dyhead import DyHead
 from .dt_fpn import DTFPN
@@ -26,5 +27,5 @@ __all__ = [
     'FPN', 'BFP', 'ChannelMapper', 'HRFPN', 'NASFPN', 'FPN_CARAFE', 'PAFPN',
     'NASFCOS_FPN', 'RFP', 'YOLOV3Neck', 'FPG', 'DilatedEncoder',
     'CTResNetNeck', 'SSDNeck', 'YOLOXPAFPN', 'DyHead', 'CSPNeXtPAFPN', 'SSH',
-    'FPN_DropBlock', 'HF_FPN', 'IG_FPN', 'DTFPN'
+    'FPN_DropBlock', 'HF_FPN', 'IG_FPN', 'DTFPN', 'DTCSPNeXtPAFPN'
 ]

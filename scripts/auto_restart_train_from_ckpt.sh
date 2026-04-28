@@ -6,6 +6,8 @@ CONFIG="${1:?config is required}"
 WORKDIR="${2:?workdir is required}"
 INITIAL_CKPT="${3:-}"
 SESSION_NAME="${4:-}"
+shift $(( $# >= 4 ? 4 : $# ))
+EXTRA_TRAIN_ARGS=("$@")
 
 cd ~/projects/mmdetection || exit 1
 set +u
@@ -26,6 +28,72 @@ export PYTHONFAULTHANDLER=1
 # If no new log output for this long, treat as hang and restart.
 STALL_TIMEOUT_SECONDS="${STALL_TIMEOUT_SECONDS:-120}"
 STALL_CHECK_INTERVAL_SECONDS="${STALL_CHECK_INTERVAL_SECONDS:-10}"
+
+detect_target_epoch() {
+  local config_path="$1"
+  local epoch
+  local base_rel
+  local base_path
+
+  epoch=$(grep -Eo 'max_epochs[[:space:]]*=[[:space:]]*[0-9]+' "$config_path" 2>/dev/null | tail -n 1 | grep -Eo '[0-9]+' | tail -n 1)
+  if [ -n "${epoch:-}" ]; then
+    echo "$epoch"
+    return 0
+  fi
+
+  epoch=$(grep -Eo 'max_epochs[[:space:]]*:[[:space:]]*[0-9]+|max_epochs=[0-9]+' "$config_path" 2>/dev/null | tail -n 1 | grep -Eo '[0-9]+' | tail -n 1)
+  if [ -n "${epoch:-}" ]; then
+    echo "$epoch"
+    return 0
+  fi
+
+  base_rel=$(sed -n "s/^_base_[[:space:]]*=[[:space:]]*\['\([^']*\)'\].*/\1/p" "$config_path" | head -n 1)
+  if [ -n "${base_rel:-}" ]; then
+    base_path=$(python - <<'PY' "$config_path" "$base_rel"
+import os
+import sys
+
+config_path = sys.argv[1]
+base_rel = sys.argv[2]
+print(os.path.normpath(os.path.join(os.path.dirname(config_path), base_rel)))
+PY
+)
+    if [ -n "${base_path:-}" ] && [ -f "$base_path" ]; then
+      epoch=$(detect_target_epoch "$base_path")
+      if [ -n "${epoch:-}" ]; then
+        echo "$epoch"
+        return 0
+      fi
+    fi
+  fi
+
+  echo ""
+}
+
+TARGET_EPOCH="${TARGET_EPOCH:-$(detect_target_epoch "$CONFIG")}" 
+
+is_training_complete() {
+  local target_epoch="$1"
+  local log_file
+
+  if [ -z "${target_epoch:-}" ]; then
+    return 1
+  fi
+
+  if [ -f "$WORKDIR/epoch_${target_epoch}.pth" ]; then
+    return 0
+  fi
+
+  if [ -d "$WORKDIR/auto_logs" ]; then
+    while IFS= read -r -d '' log_file; do
+      if grep -qE "Epoch\\(val\\) \[$target_epoch\]\\[[0-9]+/[0-9]+\\].*coco/segm_mAP|Epoch\\(train\\) \[$target_epoch\]\\[[0-9]+/[0-9]+\\]" "$log_file" 2>/dev/null; then
+        return 0
+      fi
+    done < <(find "$WORKDIR/auto_logs" -maxdepth 1 -type f -name 'run_*.log' -print0 2>/dev/null)
+  fi
+
+  return 1
+}
 
 pick_resume_ckpt() {
   if [ -f "$WORKDIR/last_checkpoint" ]; then
@@ -123,16 +191,29 @@ run_with_watchdog() {
 
 attempt=0
 while true; do
+  if is_training_complete "$TARGET_EPOCH"; then
+    echo "[$(date '+%F %T')] detected completed training before launch (target_epoch=${TARGET_EPOCH:-unknown}); exiting" | tee -a "$RUNNER_LOG"
+    break
+  fi
+
   attempt=$((attempt + 1))
   ts=$(date +%Y%m%d_%H%M%S)
   run_log="$WORKDIR/auto_logs/run_$ts.log"
   resume_ckpt="$(pick_resume_ckpt)"
 
-  echo "[$(date '+%F %T')] attempt=$attempt session=${SESSION_NAME:-<none>} resume=${resume_ckpt:-<none>} stall_timeout=${STALL_TIMEOUT_SECONDS}s stall_check_interval=${STALL_CHECK_INTERVAL_SECONDS}s" | tee -a "$RUNNER_LOG" "$run_log"
+  extra_args_str="<none>"
+  if [ ${#EXTRA_TRAIN_ARGS[@]} -gt 0 ]; then
+    printf -v extra_args_str '%q ' "${EXTRA_TRAIN_ARGS[@]}"
+  fi
+
+  echo "[$(date '+%F %T')] attempt=$attempt session=${SESSION_NAME:-<none>} resume=${resume_ckpt:-<none>} stall_timeout=${STALL_TIMEOUT_SECONDS}s stall_check_interval=${STALL_CHECK_INTERVAL_SECONDS}s extra_args=${extra_args_str}" | tee -a "$RUNNER_LOG" "$run_log"
 
   train_cmd=(python -X faulthandler tools/train.py "$CONFIG" --work-dir "$WORKDIR")
   if [ -n "$resume_ckpt" ]; then
     train_cmd+=(--resume "$resume_ckpt")
+  fi
+  if [ ${#EXTRA_TRAIN_ARGS[@]} -gt 0 ]; then
+    train_cmd+=("${EXTRA_TRAIN_ARGS[@]}")
   fi
 
   set +e
@@ -143,6 +224,11 @@ while true; do
   echo "[$(date '+%F %T')] exit_code=$exit_code" | tee -a "$RUNNER_LOG" "$run_log"
   if [ "$exit_code" -eq 0 ]; then
     echo "[$(date '+%F %T')] training finished normally" | tee -a "$RUNNER_LOG" "$run_log"
+    break
+  fi
+
+  if is_training_complete "$TARGET_EPOCH"; then
+    echo "[$(date '+%F %T')] detected completed training after non-zero exit (target_epoch=${TARGET_EPOCH:-unknown}); exiting without restart" | tee -a "$RUNNER_LOG" "$run_log"
     break
   fi
 
