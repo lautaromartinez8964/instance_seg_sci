@@ -2,151 +2,116 @@
 
 ## 统计口径
 
-- 本页统一使用 36e 训练过程中的验证集 `segm` 指标，来源均为各自 `vis_data/scalars.json`。
-- 记录每条实验线的最佳 epoch 指标、`epoch 36` 指标，以及 `best -> final` 回落幅度。
-- 当前只保留三条主线：`Mask R-CNN R50`、`Official VMamba 2292`、`Shared DT-FPN v2`。
-- 为保持口径一致，本页暂不混入 IBD 系列，也不把 `test_eval` 结果与训练期验证结果混写在同一张主表里。
-- Params 为按实际配置构建后统计得到的检测器总参数量；FLOPs 统一按 input 640×640 记录，VMamba 系列使用 Triton-safe 统计脚本估算；FPS / latency / CUDA Memory 由 `profile_gravel_big.py` 测得（`inference_detector` 直接计时，warmup=20, iter=100, batch=1）。
+- 当前页面只保留两条有效主线：`RTMDet-Ins-Tiny baseline` 与 `RTMDet-Ins-Tiny Shared DT-FPN v3`。
+- 精度统一采用 `gravel_big val set` 上的 `segm` 验证指标，来源为训练日志中的 `Epoch(val)` 最佳记录与最终 `epoch 120` 记录。
+- Params / FLOPs / FPS / latency / CUDA Memory 统一按 `input 640x640` 统计。
+- Params 与 FLOPs 来自实际配置构建后的 profiling；FPS / latency / CUDA Memory 由 `tools/analysis_tools/profile_gravel_big.py` 测得，口径为 `warmup=20, iter=100, batch=1`。
+- 其余历史实验线均作废，不再纳入主表。
 
 ---
 
-## Mask R-CNN R50 完整指标记录
+## RTMDet-Ins-Tiny baseline 完整指标记录
 
 ### 1. 精度指标（gravel_big val set, 640×640 patches）
 
 | 指标 | 数值 |
 | --- | ---: |
-| segm mAP | 0.277 |
-| mAP₅₀ | 0.436 |
-| mAP₇₅ | 0.318 |
-| mAPₛ | 0.214 |
-| mAPₘ | 0.548 |
-| mAPₗ | 0.672 |
+| segm mAP | 0.272 |
+| mAP₅₀ | 0.430 |
+| mAP₇₅ | 0.314 |
+| mAPₛ | 0.213 |
+| mAPₘ | 0.531 |
+| mAPₗ | 0.658 |
 
-### 2. 模型参数指标
+### 2. 模型效率指标
 
 | 指标 | 数值 |
 | --- | ---: |
-| Params (M) | 43.971 |
-| FLOPs (G) | 142 |
-| FPS | 85.1 img/s |
-| latency | 11.7 ms/img |
-| CUDA Memory | 487 MB |
+| Params (M) | 5.615 |
+| FLOPs (G) | 11.873 |
+| FPS | 156.7 img/s |
+| latency | 6.4 ms/img |
+| CUDA Memory | 64 MB |
 
 ### 3. 训练配置
 
-- Backbone: ResNet-50 (ImageNet pretrained, COCO init)
-- Schedule: 36e, milestones=[24, 33]
-- Optimizer: SGD, lr=0.005, momentum=0.9, weight_decay=0.0001
-- Batch size: 4
-- Input size: 640×640 (multi-scale train: 512/640/768)
+- Backbone: CSPNeXt-Tiny (`deepen_factor=0.167`, `widen_factor=0.375`)
+- Neck: CSPNeXtPAFPN
+- Head: RTMDetInsSepBNHead
+- Schedule: 120e
+- Optimizer: AdamW, lr=2.5e-4, weight_decay=0.05
+- Batch size: 16
+- Input size: 640×640
+- 强增强策略: 前 100e 使用 Mosaic + MixUp，后 20e 通过 `PipelineSwitchHook` 切换到弱增强精调
 - GPU: RTX 5090
-- Best epoch: 31
-- epoch36 mAP: 0.276, best-final drop: 0.001
-
-### 4. 指标来源
-
-- 精度: `work_dirs_gravel_big/mask_rcnn_r50_fpn_36e_gravel_big/20260415_182802/vis_data/scalars.json`
-- Params/FLOPs/FPS/Memory: `python tools/analysis_tools/profile_gravel_big.py configs/gravel_big/mask_rcnn_r50_fpn_36e_gravel_big.py --input-size 640 640`
-
----
-
-## Official VMamba 2292 完整指标记录
-
-### 1. 精度指标（gravel_big val set, 640×640 patches）
-
-| 指标 | 数值 |
-| --- | ---: |
-| segm mAP | 0.283 |
-| mAP₅₀ | 0.436 |
-| mAP₇₅ | 0.327 |
-| mAPₛ | 0.220 |
-| mAPₘ | 0.552 |
-| mAPₗ | 0.669 |
-
-### 2. 模型参数指标
-
-| 指标 | 数值 |
-| --- | ---: |
-| Params (M) | 57.564 |
-| FLOPs (G) | 159 |
-| FPS | 49.0 img/s |
-| latency | 20.4 ms/img |
-| CUDA Memory | 559 MB |
-
-### 3. 训练配置
-
-- Backbone: MM_VMamba (dims=[96,192,384,768], depths=[2,2,9,2])
-- Schedule: 36e, milestones=[24, 33]
-- Optimizer: AdamW, lr=0.0002, weight_decay=0.05
-- Batch size: 4
-- Input size: 640×640 (multi-scale train: 512/640/768)
-- GPU: RTX 5090
-- Pretrained: checkpoints/vmamba/vssm_tiny_0230_ckpt_epoch_262.pth
-- Best epoch: 27
-- epoch36 mAP: 0.281, best-final drop: 0.002
+- Pretrained: `cspnext-tiny_imagenet_600e.pth`
+- Best epoch: 119
+- epoch120 mAP: 0.272
+- best-final drop: 0.000
 
 ### 4. 备注
 
-- 加载 ImageNet checkpoint 时存在部分 missing keys（checkpoint 深度与 stage-3 的 2292 配置不完全一致）。
-- FLOPs 使用 `get_flops_vmamba_safe.py` (Triton-safe) 估算，backbone FLOPs 由 `Backbone_VSSM.flops()` 解析计算，Neck+Head FLOPs 由 mmengine `get_model_complexity_info` 追踪。
+- 这是当前 RTMDet-Ins 路线的标准基线。
+- 最优点出现在 119 epoch，但 120 epoch 基本持平，说明后期已经进入稳定平台。
 
 ### 5. 指标来源
 
-- 精度: `work_dirs_gravel_big/mask_rcnn_vmamba_official_2292_fpn_36e_gravel_big/20260415_213016/vis_data/scalars.json`
-- Params/FLOPs: `python tools/analysis_tools/get_flops_vmamba_safe.py configs/gravel_big/mask_rcnn_vmamba_official_2292_fpn_36e_gravel_big.py`
-- FPS/Memory: `python tools/analysis_tools/profile_gravel_big.py configs/gravel_big/mask_rcnn_vmamba_official_2292_fpn_36e_gravel_big.py --input-size 640 640`
+- 精度: `work_dirs_gravel_big/rtmdet_ins_tiny_baseline_120e_gravel_big/20260424_122434/20260424_122434.log`
+- Params / FLOPs / FPS / Memory: `python tools/analysis_tools/profile_gravel_big.py configs/gravel_big/rtmdet_ins_tiny_baseline_120e_gravel_big.py --input-size 640 640`
 
 ---
 
-## Shared DT-FPN v2 完整指标记录
+## RTMDet-Ins-Tiny Shared DT-FPN v3 完整指标记录
 
 ### 1. 精度指标（gravel_big val set, 640×640 patches）
 
 | 指标 | 数值 |
 | --- | ---: |
-| segm mAP | 0.286 |
-| mAP₅₀ | 0.437 |
-| mAP₇₅ | 0.331 |
-| mAPₛ | 0.225 |
-| mAPₘ | 0.555 |
-| mAPₗ | 0.673 |
+| segm mAP | 0.281 |
+| mAP₅₀ | 0.443 |
+| mAP₇₅ | 0.321 |
+| mAPₛ | 0.218 |
+| mAPₘ | 0.554 |
+| mAPₗ | 0.676 |
 
-### 2. 模型参数指标
+### 2. 模型效率指标
 
 | 指标 | 数值 |
 | --- | ---: |
-| Params (M) | 60.072 |
-| FLOPs (G) | 184 |
-| FPS | 44.8 img/s |
-| latency | 22.3 ms/img |
-| CUDA Memory | 572 MB |
+| Params (M) | 7.275 |
+| FLOPs (G) | 15.989 |
+| FPS | 155.1 img/s |
+| latency | 6.4 ms/img |
+| CUDA Memory | 70 MB |
 
 ### 3. 训练配置
 
-- Backbone: MM_VMamba (dims=[96,192,384,768], depths=[2,2,9,2])，同 Official VMamba 2292
-- Neck: DTFPN (guided_levels=[0,1,2], dt_head_channels=128, dt_loss_weight=0.2)
-- Detector: RSMaskRCNN (支持 DT 辅助 loss)
-- Schedule: 36e
-- Optimizer: AmpOptimWrapper (AdamW, lr=0.0002, weight_decay=0.05)
-- Batch size: 4
-- Input size: 640×640 (multi-scale train: 512/640/704)
+- Backbone: CSPNeXt-Tiny (`deepen_factor=0.167`, `widen_factor=0.375`)，与 baseline 相同
+- Neck: `DTCSPNeXtPAFPN`
+- Detector: `RTMDetWithAuxNeck`
+- Schedule: 120e
+- Optimizer: AdamW, lr=2.5e-4, weight_decay=0.05
+- Batch size: 16
+- Input size: 640×640
+- DT 设置: `guided_levels=[0,1]`, `dt_mode='shared'`, `dt_decoder_source='inputs'`, `dt_head_channels=128`, `dt_loss_weight=0.2`, `skip_csp_on_guided=True`
+- DT 标签路径: `data/gravel_big_mmdet/auxiliary_labels_coreband/<split>/distance_transform/*.png`
 - GPU: RTX 5090
-- Pretrained: checkpoints/vmamba/vssm_tiny_0230_ckpt_epoch_262.pth
-- Best epoch: 18
-- epoch36 mAP: 0.278, best-final drop: 0.008
+- Best epoch: 111
+- epoch120 mAP: 0.280
+- best-final drop: 0.001
 
 ### 4. 备注
 
-- 相比 Official VMamba 2292 基线（segm mAP=0.283），DT-FPN v2 提升 +0.003，且收敛更快（达峰 epoch 18 vs 27）。
-- 但后期回落较大（best-final drop 0.008），暴露了 shared DT 设计的后期尺度冲突。
-- 额外参数量约 2.5M（主要来自 DT 解码头），额外 FLOPs 约 25G。
+- 相比 baseline，最佳 `segm mAP` 提升 `+0.009`。
+- 增益主要体现在中大尺度实例：`mAPₘ +0.023`，`mAPₗ +0.018`。
+- 额外代价主要集中在 neck：总参数增加约 `+1.660M`，FLOPs 增加约 `+4.116G`。
+- FPS 基本与 baseline 持平，但显存占用略高。
+- 需要强调的是，这个版本的收益并非“纯 neck 改进”单因素结论；它同时改动了训练 pipeline，去掉了 baseline 的 Mosaic / MixUp + PipelineSwitch 方案，改成了全程简化增强并加入 DT 辅助监督。
 
 ### 5. 指标来源
 
-- 精度: `work_dirs_gravel_big/mask_rcnn_gravel_lightmamba_dt_fpn_v2_36e_gravel_big/20260420_171117/vis_data/scalars.json`
-- Params/FLOPs: `python tools/analysis_tools/get_flops_vmamba_safe.py configs/gravel_big/mask_rcnn_gravel_lightmamba_dt_fpn_v2_36e_gravel_big.py`
-- FPS/Memory: `python tools/analysis_tools/profile_gravel_big.py configs/gravel_big/mask_rcnn_gravel_lightmamba_dt_fpn_v2_36e_gravel_big.py --input-size 640 640`
+- 精度: `work_dirs_gravel_big/rtmdet_ins_tiny_shared_dt_fpn_v3_120e_gravel_big/auto_logs/run_20260429_161133.log`
+- Params / FLOPs / FPS / Memory: `python tools/analysis_tools/profile_gravel_big.py configs/gravel_big/rtmdet_ins_tiny_shared_dt_fpn_v3_120e_gravel_big.py --input-size 640 640`
 
 ---
 
@@ -154,39 +119,33 @@
 
 ### 精度对比
 
-| 模型 | best epoch | segm mAP | mAP₅₀ | mAP₇₅ | mAPₛ | mAPₘ | mAPₗ | epoch36 mAP | best-final drop |
+| 模型 | best epoch | segm mAP | mAP₅₀ | mAP₇₅ | mAPₛ | mAPₘ | mAPₗ | epoch120 mAP | best-final drop |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Mask R-CNN R50 | 31 | 0.277 | 0.436 | 0.318 | 0.214 | 0.548 | 0.672 | 0.276 | 0.001 |
-| Official VMamba 2292 | 27 | 0.283 | 0.436 | 0.327 | 0.220 | 0.552 | 0.669 | 0.281 | 0.002 |
-| Shared DT-FPN v2 | 18 | 0.286 | 0.437 | 0.331 | 0.225 | 0.555 | 0.673 | 0.278 | 0.008 |
+| RTMDet-Ins-Tiny baseline | 119 | 0.272 | 0.430 | 0.314 | 0.213 | 0.531 | 0.658 | 0.272 | 0.000 |
+| RTMDet-Ins-Tiny Shared DT-FPN v3 | 111 | 0.281 | 0.443 | 0.321 | 0.218 | 0.554 | 0.676 | 0.280 | 0.001 |
 
-### 模型参数对比
+### 模型效率对比
 
 | 模型 | Params (M) | FLOPs (G) | FPS (img/s) | Latency (ms) | CUDA Memory (MB) |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Mask R-CNN R50 | 43.971 | 142 | 85.1 | 11.7 | 487 |
-| Official VMamba 2292 | 57.564 | 159 | 49.0 | 20.4 | 559 |
-| Shared DT-FPN v2 | 60.072 | 184 | 44.8 | 22.3 | 572 |
+| RTMDet-Ins-Tiny baseline | 5.615 | 11.873 | 156.7 | 6.4 | 64 |
+| RTMDet-Ins-Tiny Shared DT-FPN v3 | 7.275 | 15.989 | 155.1 | 6.4 | 70 |
 
-### 收敛速度对比
+### 相对 baseline 的增量
 
-| 模型 | epoch10 mAP | epoch18 mAP | 达峰 epoch | 现象 |
-| --- | ---: | ---: | ---: | --- |
-| Mask R-CNN R50 | 0.264 | 0.273 | 31 | 前期稳定，但爬升偏慢，后半程才摸到最优。 |
-| Official VMamba 2292 | 0.271 | 0.278 | 27 | 中前期已经优于 R50，后期还能继续小幅抬升。 |
-| Shared DT-FPN v2 | 0.278 | 0.286 | 18 | 三者中收敛最快，早期直接冲顶，但后期回落最大。 |
+| 模型 | segm mAP 增量 | Params 增量 | FLOPs 增量 | FPS 变化 | CUDA Memory 增量 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| RTMDet-Ins-Tiny Shared DT-FPN v3 | +0.009 | +1.660 M (+29.6%) | +4.116 G (+34.7%) | -1.6 img/s | +6 MB |
 
 ---
 
 ## 关键结论
 
-1. 当前三条主线里，峰值最高的是 `Shared DT-FPN v2`，最佳 `segm mAP = 0.286`。
-2. 当前最强的纯 backbone/FPN 基线仍然是 `Official VMamba 2292`，最佳 `segm mAP = 0.283`。
-3. `Mask R-CNN R50` 仍然是最稳的基础对照组，峰值不高，但 `best-final drop` 只有 `0.001`。
-4. `Shared DT-FPN v2` 的最大价值在于两点同时成立：
-	- 它把前期收敛速度拉到了三者最高。
-	- 它也暴露了 shared DT 设计的后期尺度冲突，为后续 per-level DT 改造提供了最直接证据。
-5. 效率对比：R50 在所有效率指标上遥遥领先（85.1 FPS, 487MB），VMamba 2292 较 R50 慢约 1.7×，DT-FPN v2 因额外 DT 解码头略慢于 2292（44.8 vs 49.0 FPS），额外开销约 9%。
+1. 当前有效 RTMDet-Ins 路线里，峰值最高的是 `RTMDet-Ins-Tiny Shared DT-FPN v3`，最佳 `segm mAP = 0.281 @ epoch 111`。
+2. baseline 的最佳 `segm mAP = 0.272`，且在 119 / 120 epoch 基本持平，说明后期训练非常稳定。
+3. DT-FPN v3 的主要收益不在“小目标暴涨”，而在中大尺度实例的结构完整性与分离能力增强：`mAPₘ` 和 `mAPₗ` 提升最明显。
+4. DT-FPN v3 的代价是约 `29.6%` 参数增长与 `34.7%` FLOPs 增长，但推理速度几乎不掉，说明这次增参集中在 neck 内部、且工程代价可控。
+5. 从实验叙事上，应将该版本描述为“DT-guided neck + 简化训练增强策略”的联动收益，而不是纯 neck 单因素结论。
 
 ---
 
@@ -194,13 +153,12 @@
 
 按验证集最佳 `segm mAP` 排序：
 
-1. Shared DT-FPN v2: `0.286 @ epoch 18`
-2. Official VMamba 2292: `0.283 @ epoch 27`
-3. Mask R-CNN R50: `0.277 @ epoch 31`
+1. RTMDet-Ins-Tiny Shared DT-FPN v3: `0.281 @ epoch 111`
+2. RTMDet-Ins-Tiny baseline: `0.272 @ epoch 119`
 
 ---
 
-这页文档后续如果要继续扩展，优先补：
+这页文档后续如果继续扩展，优先补：
 
-- `Per-level DT-FPN v3`
-- `DT-FPN v2` 的独立 `test_eval`
+- `DT-FPN v3` 的严格纯结构对照实验
+- `RTMDet-Ins-Tiny baseline / DT-FPN v3` 的 test set 独立评估结果

@@ -27,6 +27,9 @@ class DTCSPNeXtPAFPN(CSPNeXtPAFPN):
                  dt_decoder_source: str = 'inputs',
                  dt_head_channels: int = 64,
                  dt_loss_weight: float = 0.2,
+                 skip_csp_on_guided: bool = False,
+                 uagd_boundary_weight: float = 0.0,
+                 uagd_boundary_channels: int = 32,
                  use_residual_fusion: bool = False,
                  use_channel_attention: bool = False,
                  **kwargs) -> None:
@@ -58,6 +61,7 @@ class DTCSPNeXtPAFPN(CSPNeXtPAFPN):
 
         self.dt_mode = dt_mode
         self.dt_decoder_source = dt_decoder_source
+        self.skip_csp_on_guided = skip_csp_on_guided
         if self.dt_decoder_source == 'inputs':
             dt_decoder_in_channels = list(self.in_channels)
         else:
@@ -119,6 +123,17 @@ class DTCSPNeXtPAFPN(CSPNeXtPAFPN):
         self._last_dt_loss: Tensor | None = None
         self.last_gates: Tuple[Tensor, ...] = ()
 
+        # UAGD L1 boundary supervision head
+        self._uagd_boundary_weight = float(max(uagd_boundary_weight, 0.0))
+        self._current_b_tea_target: Tensor | None = None
+        self._last_b_loss: Tensor | None = None
+        if self._uagd_boundary_weight > 0:
+            self.boundary_head = nn.Sequential(
+                nn.Conv2d(self.out_channels, uagd_boundary_channels,
+                          kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(uagd_boundary_channels, 1, kernel_size=1))
+
     def _extract_dt_target(self, data_sample,
                            device: torch.device) -> tuple[Tensor | None, Tensor | None]:
         if 'gt_sem_seg' not in data_sample:
@@ -177,6 +192,35 @@ class DTCSPNeXtPAFPN(CSPNeXtPAFPN):
         self._last_dt_maps = ()
         self._last_dt_loss = None
 
+        # Extract UAGD B_tea targets (same gt_sem_seg channel, ÷255 → [0,1])
+        if self._uagd_boundary_weight > 0:
+            b_targets = []
+            for data_sample in batch_data_samples:
+                if 'gt_sem_seg' not in data_sample:
+                    self._current_b_tea_target = None
+                    break
+                b_tea = data_sample.gt_sem_seg.sem_seg.to(
+                    device=device, dtype=torch.float32)
+                if b_tea.ndim == 2:
+                    b_tea = b_tea.unsqueeze(0)
+                b_tea = b_tea[:1]
+                b_tea = b_tea / 255.0  # uint8 0-255 → float [0, 1]
+                b_tea = b_tea.clamp_(0.0, 1.0)
+                if input_shape is not None and b_tea.shape[-2:] != input_shape:
+                    pad_h = input_shape[0] - b_tea.shape[-2]
+                    pad_w = input_shape[1] - b_tea.shape[-1]
+                    if pad_h >= 0 and pad_w >= 0:
+                        b_tea = F.pad(b_tea, (0, pad_w, 0, pad_h))
+                    else:
+                        b_tea = F.interpolate(
+                            b_tea.unsqueeze(0), size=input_shape,
+                            mode='bilinear', align_corners=False).squeeze(0)
+                b_targets.append(b_tea)
+            else:
+                self._current_b_tea_target = \
+                    torch.stack(b_targets, dim=0) if b_targets else None
+        self._last_b_loss = None
+
     def clear_auxiliary_targets(self) -> None:
         self._current_dt_target = None
         self._current_dt_valid_mask = None
@@ -184,6 +228,21 @@ class DTCSPNeXtPAFPN(CSPNeXtPAFPN):
         self._last_dt_maps = ()
         self._last_dt_loss = None
         self.last_gates = ()
+        self._current_b_tea_target = None
+        self._last_b_loss = None
+
+    def _compute_uagd_boundary_loss(self, b_stu: Tensor) -> Tensor | None:
+        """MSE between predicted boundary map and B_tea target."""
+        if self._current_b_tea_target is None \
+                or self._uagd_boundary_weight <= 0:
+            return None
+        b_tea = self._current_b_tea_target  # (B, 1, H, W)
+        # Downsample B_tea to P3 stride (1/8)
+        target_size = b_stu.shape[-2:]
+        b_tea_down = F.interpolate(
+            b_tea, size=target_size, mode='bilinear', align_corners=False)
+        loss = F.mse_loss(b_stu, b_tea_down)
+        return self._uagd_boundary_weight * loss
 
     def _compute_dt_loss(self,
                          dt_maps: Tensor | Tuple[Tensor, ...]) -> Tensor | None:
@@ -226,11 +285,13 @@ class DTCSPNeXtPAFPN(CSPNeXtPAFPN):
         return torch.stack(loss_terms).mean() * self._dt_loss_weight
 
     def get_auxiliary_losses(self) -> dict:
-        loss = self._last_dt_loss
+        losses = {}
+        if self._last_dt_loss is not None:
+            losses['loss_neck_dt'] = self._last_dt_loss
+        if self._last_b_loss is not None:
+            losses['loss_neck_uagd_b'] = self._last_b_loss
         self.clear_auxiliary_targets()
-        if loss is None:
-            return {}
-        return {'loss_neck_dt': loss}
+        return losses
 
     def get_last_dt_map(self) -> Tensor | None:
         return self._last_dt_map
@@ -332,8 +393,11 @@ class DTCSPNeXtPAFPN(CSPNeXtPAFPN):
                 guided_low = feat_low * (1.0 - gate) + upsample_feat * gate
                 gate_records.insert(0, gate.detach())
 
-            inner_out = self.top_down_blocks[fusion_idx](
-                torch.cat([upsample_feat, guided_low], 1))
+            if target_level in self.guided_levels and self.skip_csp_on_guided:
+                inner_out = guided_low
+            else:
+                inner_out = self.top_down_blocks[fusion_idx](
+                    torch.cat([upsample_feat, guided_low], 1))
             inner_outs.insert(0, inner_out)
 
         self.last_gates = tuple(gate_records)
@@ -378,5 +442,10 @@ class DTCSPNeXtPAFPN(CSPNeXtPAFPN):
 
         for idx, conv in enumerate(self.out_convs):
             outs[idx] = conv(outs[idx])
+
+        # UAGD L1: predict boundary map from P3 (outs[0], stride 8)
+        if self._uagd_boundary_weight > 0 and self.training:
+            b_stu = torch.sigmoid(self.boundary_head(outs[0]))  # (B,1,H/8,W/8)
+            self._last_b_loss = self._compute_uagd_boundary_loss(b_stu)
 
         return tuple(outs)

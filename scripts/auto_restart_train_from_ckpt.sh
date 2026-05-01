@@ -72,9 +72,49 @@ PY
 
 TARGET_EPOCH="${TARGET_EPOCH:-$(detect_target_epoch "$CONFIG")}" 
 
+list_candidate_logs() {
+  find "$WORKDIR" \
+    \( -path "$WORKDIR/auto_logs/run_*.log" -o -path "$WORKDIR/*/*.log" -o -path "$WORKDIR/*.log" \) \
+    -type f -print0 2>/dev/null
+}
+
+detect_iters_per_epoch() {
+  local log_file
+  local iters_per_epoch
+
+  while IFS= read -r -d '' log_file; do
+    iters_per_epoch=$(grep -Eo 'Epoch\(train\)[[:space:]]*\[[0-9]+\]\[[0-9]+/[0-9]+\]' "$log_file" 2>/dev/null | \
+      sed -E 's/.*\[[0-9]+\/([0-9]+)\]/\1/' | tail -n 1)
+    if [ -n "${iters_per_epoch:-}" ]; then
+      echo "$iters_per_epoch"
+      return 0
+    fi
+  done < <(list_candidate_logs)
+
+  echo ""
+}
+
+pick_latest_iter_ckpt() {
+  local latest_iter
+
+  latest_iter=$(ls "$WORKDIR"/iter_*.pth 2>/dev/null | \
+    sed -E 's/.*iter_([0-9]+)\.pth/\1 &/' | \
+    sort -n | tail -1 | awk '{print $2}')
+  if [ -n "${latest_iter:-}" ] && [ -f "$latest_iter" ]; then
+    echo "$latest_iter"
+    return 0
+  fi
+
+  echo ""
+}
+
 is_training_complete() {
   local target_epoch="$1"
   local log_file
+  local iters_per_epoch
+  local target_iters
+  local latest_iter_ckpt
+  local latest_iter
 
   if [ -z "${target_epoch:-}" ]; then
     return 1
@@ -84,12 +124,20 @@ is_training_complete() {
     return 0
   fi
 
-  if [ -d "$WORKDIR/auto_logs" ]; then
-    while IFS= read -r -d '' log_file; do
-      if grep -qE "Epoch\\(val\\) \[$target_epoch\]\\[[0-9]+/[0-9]+\\].*coco/segm_mAP|Epoch\\(train\\) \[$target_epoch\]\\[[0-9]+/[0-9]+\\]" "$log_file" 2>/dev/null; then
+  while IFS= read -r -d '' log_file; do
+      if grep -qE "Epoch\\(val\\) \[$target_epoch\]\\[[0-9]+/[0-9]+\\].*coco/segm_mAP" "$log_file" 2>/dev/null; then
         return 0
       fi
-    done < <(find "$WORKDIR/auto_logs" -maxdepth 1 -type f -name 'run_*.log' -print0 2>/dev/null)
+  done < <(list_candidate_logs)
+
+  iters_per_epoch=$(detect_iters_per_epoch)
+  latest_iter_ckpt=$(pick_latest_iter_ckpt)
+  if [ -n "${iters_per_epoch:-}" ] && [ -n "${latest_iter_ckpt:-}" ]; then
+    latest_iter=$(basename "$latest_iter_ckpt" | sed -E 's/^iter_([0-9]+)\.pth$/\1/')
+    target_iters=$((target_epoch * iters_per_epoch))
+    if [ -n "${latest_iter:-}" ] && [ "$latest_iter" -ge "$target_iters" ]; then
+      return 0
+    fi
   fi
 
   return 1
